@@ -47,7 +47,7 @@ class CometStringExpressionSuite extends CometTestBase with CometCodegenAssertio
   }
 
   for ((function, expressionName) <- Seq("lpad" -> "StringLPad", "rpad" -> "StringRPad")) {
-    test(s"$function dispatches unsupported argument shapes (issue #5579)") {
+    test(s"$function routing for unsupported argument shapes") {
       val data: Seq[(String, Option[Int], String)] = Seq(
         ("hi", Some(5), "xy"),
         ("hello", Some(3), "x"),
@@ -61,15 +61,24 @@ class CometStringExpressionSuite extends CometTestBase with CometCodegenAssertio
         withSQLConf(
           SQLConf.OPTIMIZER_EXCLUDED_RULES.key ->
             "org.apache.spark.sql.catalyst.optimizer.ConstantFolding") {
-          for (allowIncompatible <- Seq("false", "true")) {
+          // Unsupported shapes have no native implementation, even with allowIncompatible=true.
+          for {
+            allowIncompatible <- Seq("false", "true")
+            codegenEnabled <- Seq("false", "true")
+          } {
             withSQLConf(
-              CometConf.getExprAllowIncompatConfigKey(expressionName) -> allowIncompatible) {
+              CometConf.getExprAllowIncompatConfigKey(expressionName) -> allowIncompatible,
+              CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> codegenEnabled) {
               for (query <- Seq(
                   s"SELECT $function(_1, _2, _3) FROM tbl",
                   s"SELECT $function('hi', _2, 'xy') FROM tbl",
                   s"SELECT $function('hi', 5, 'xy') FROM tbl")) {
-                assertCodegenRan {
-                  checkSparkAnswerAndOperator(query)
+                if (codegenEnabled.toBoolean) {
+                  checkSparkAnswerAndImpl(query, native = Seq.empty, dispatched = Seq(function))
+                } else {
+                  checkSparkAnswerAndFallbackReason(
+                    query,
+                    s"$function: ${CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key}=false")
                 }
               }
             }
@@ -78,16 +87,21 @@ class CometStringExpressionSuite extends CometTestBase with CometCodegenAssertio
       }
     }
 
-    test(s"$function keeps supported argument shapes native") {
+    test(s"$function routing for supported argument shapes") {
       withParquetTable(Seq(("hi", 5), ("hello", 3), ("", 0)), "tbl") {
-        for (query <- Seq(
-            s"SELECT $function(_1, _2) FROM tbl",
-            s"SELECT $function(_1, _2, 'xy') FROM tbl")) {
-          CometScalaUDFCodegen.resetStats()
-          checkSparkAnswerAndOperator(query)
-          assert(
-            CometScalaUDFCodegen.stats().totalLookups == 0,
-            s"expected native execution for $query")
+        for {
+          allowIncompatible <- Seq("false", "true")
+          codegenEnabled <- Seq("false", "true")
+        } {
+          withSQLConf(
+            CometConf.getExprAllowIncompatConfigKey(expressionName) -> allowIncompatible,
+            CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> codegenEnabled) {
+            for (query <- Seq(
+                s"SELECT $function(_1, _2) FROM tbl",
+                s"SELECT $function(_1, _2, 'xy') FROM tbl")) {
+              checkSparkAnswerAndImpl(query, native = Seq(function), dispatched = Seq.empty)
+            }
+          }
         }
       }
     }
