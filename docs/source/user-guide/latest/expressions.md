@@ -349,12 +349,12 @@ The type-name conversion functions (`bigint`, `binary`, `boolean`, `date`, `deci
 | Function | Status | Implementation | Notes |
 | --- | --- | --- | --- |
 | `crc32` | ✅ | Native |  |
-| `hash` | ✅ | Native |  |
+| `hash` | ✅ | Native | Includes decimals with precision 19–38 and nested decimals |
 | `md5` | ✅ | Native |  |
 | `sha` | ✅ | Native |  |
 | `sha1` | ✅ | Native |  |
 | `sha2` | ✅ | Native |  |
-| `xxhash64` | ✅ | Native |  |
+| `xxhash64` | ✅ | Native | Includes decimals with precision 19–38 and nested decimals |
 
 ---
 
