@@ -41,6 +41,7 @@ use crate::execution::operators::{PartitionedRankLimitExec, WindowFnKind};
 use crate::execution::{
     expressions::list_empty_to_null::ListEmptyToNullExpr,
     expressions::list_positions::ListPositionsExpr,
+    expressions::map_entries::MapEntriesExpr,
     expressions::subquery::Subquery,
     operators::{
         CometFilterExec, ExecutionError, ExpandExec, ExplodeExec, ParquetCompression,
@@ -74,8 +75,7 @@ use datafusion::{
     logical_expr::Operator as DataFusionOperator,
     physical_expr::{
         expressions::{
-            in_list, BinaryExpr, CaseExpr, CastExpr, Column, IsNullExpr,
-            Literal as DataFusionLiteral,
+            BinaryExpr, CaseExpr, CastExpr, Column, IsNullExpr, Literal as DataFusionLiteral,
         },
         PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     },
@@ -93,7 +93,8 @@ use datafusion::{
 use datafusion_comet_spark_expr::{
     create_comet_physical_fun, create_comet_physical_fun_with_eval_mode, BinaryOutputStyle,
     BloomFilterAgg, BloomFilterMightContain, CometCollectList, CometCollectSet, CsvWriteOptions,
-    EvalMode, SparkArraysZipFunc, SparkBloomFilterVersion, SparkPercentile, SumInteger, ToCsv,
+    EvalMode, SparkArraysZipFunc, SparkBloomFilterVersion, SparkListAgg, SparkPercentile,
+    SumInteger, ToCsv,
 };
 use iceberg::expr::Bind;
 
@@ -148,11 +149,11 @@ use datafusion_comet_proto::{
     spark_partitioning::{partitioning::PartitioningStruct, Partitioning as SparkPartitioning},
 };
 use datafusion_comet_spark_expr::{
-    jvm_udf::JvmScalarUdfExpr, ApproxPercentile, ArrayInsert, Avg, AvgDecimal, Cast, CheckOverflow,
-    Correlation, Covariance, CreateNamedStruct, DecimalRescaleCheckOverflow, GetArrayStructFields,
-    GetStructField, HllPlusPlus, IfExpr, ListExtract, MaxMinBy, Mode, NormalizeNaNAndZero, Regr,
-    RegrType, SparkCastOptions, Stddev, SumDecimal, ToJson, UnboundColumn, Variance,
-    WideDecimalBinaryExpr, WideDecimalOp,
+    jvm_udf::JvmScalarUdfExpr, spark_in_list, ApproxPercentile, ArrayInsert, Avg, AvgDecimal, Cast,
+    CheckOverflow, Correlation, Covariance, CreateNamedStruct, DecimalRescaleCheckOverflow,
+    GetArrayStructFields, GetStructField, HllPlusPlus, IfExpr, ListExtract, MaxMinBy, Mode,
+    NormalizeNaNAndZero, Regr, RegrType, SparkCastOptions, Stddev, SumDecimal, ToJson,
+    UnboundColumn, Variance, WideDecimalBinaryExpr, WideDecimalOp,
 };
 use itertools::Itertools;
 use jni::objects::{Global, JObject};
@@ -561,6 +562,9 @@ impl PhysicalPlanner {
                         DataType::Duration(TimeUnit::Microsecond) => {
                             ScalarValue::DurationMicrosecond(None)
                         }
+                        DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano) => {
+                            ScalarValue::IntervalMonthDayNano(None)
+                        }
                         dt => {
                             return Err(GeneralError(format!("{dt:?} is not supported in Comet")))
                         }
@@ -762,7 +766,8 @@ impl PhysicalPlanner {
                     .map(|x| self.create_expr(x, Arc::clone(&input_schema)))
                     .collect::<Result<Vec<_>, _>>()?;
 
-                in_list(value, list, &expr.negated, input_schema.as_ref()).map_err(|e| e.into())
+                spark_in_list(value, list, expr.negated, input_schema.as_ref())
+                    .map_err(|e| e.into())
             }
             ExprStruct::If(expr) => {
                 let if_expr =
@@ -2053,7 +2058,7 @@ impl PhysicalPlanner {
                 let (scans, shuffle_scans, child) =
                     self.create_plan(&children[0], inputs, partition_count)?;
 
-                // Create the expression for the array to explode
+                // Create the expression for the collection to explode
                 let raw_child_expr = if let Some(child_expr) = &explode.child {
                     self.create_expr(child_expr, child.schema())?
                 } else {
@@ -2068,6 +2073,22 @@ impl PhysicalPlanner {
                     .expect("Failed to get field from child expression")
                     .name()
                     .to_string();
+
+                // Expose maps as List<Struct<key, value>>, sharing their entries buffers.
+                // Reuse the list path for outer rows, positions and bounded output batches,
+                // then flatten the entry struct into Spark's two output columns.
+                let map_fields = match raw_child_expr.data_type(&child_schema)? {
+                    DataType::Map(entries, _) => match entries.data_type() {
+                        DataType::Struct(fields) => Some(fields.clone()),
+                        _ => unreachable!("Map entries must be a struct"),
+                    },
+                    _ => None,
+                };
+                let raw_child_expr: Arc<dyn PhysicalExpr> = if map_fields.is_some() {
+                    Arc::new(MapEntriesExpr::new(raw_child_expr))
+                } else {
+                    raw_child_expr
+                };
 
                 // Bridge Spark's outer semantics: DataFusion's `UnnestExec` with
                 // `preserve_nulls = true` emits one null row for a NULL list but drops rows
@@ -2178,11 +2199,22 @@ impl PhysicalPlanner {
                     }
                 };
 
-                output_fields.push(Field::new(
-                    array_field.name(),
-                    element_type,
-                    true, // Element is nullable after unnesting
-                ));
+                let struct_unnests = if let Some(fields) = map_fields {
+                    output_fields.extend(fields.iter().map(|field| {
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_nullable(explode.outer || field.is_nullable())
+                    }));
+                    vec![array_input_index]
+                } else {
+                    output_fields.push(Field::new(
+                        array_field.name(),
+                        element_type,
+                        true, // Element is nullable after unnesting
+                    ));
+                    vec![]
+                };
 
                 let output_schema = Arc::new(Schema::new(output_fields));
 
@@ -2204,7 +2236,7 @@ impl PhysicalPlanner {
                 let unnest_exec = Arc::new(ExplodeExec::new(
                     project_exec,
                     list_unnests,
-                    vec![], // No struct columns to unnest
+                    struct_unnests,
                     output_schema,
                     unnest_options,
                 )?);
@@ -3180,6 +3212,13 @@ impl PhysicalPlanner {
                 let child = self.create_expr(expr.child.as_ref().unwrap(), Arc::clone(&schema))?;
                 let func = AggregateUDF::new_from_impl(HllPlusPlus::new(expr.precision));
                 Self::create_aggr_func_expr("approx_count_distinct", schema, vec![child], func)
+            }
+            AggExprStruct::ListAgg(expr) => {
+                let child = self.create_expr(expr.child.as_ref().unwrap(), Arc::clone(&schema))?;
+                let delimiter =
+                    self.create_expr(expr.delimiter.as_ref().unwrap(), Arc::clone(&schema))?;
+                let func = AggregateUDF::new_from_impl(SparkListAgg::new());
+                Self::create_aggr_func_expr("listagg", schema, vec![child, delimiter], func)
             }
             AggExprStruct::MaxBy(expr) => {
                 let value = self.create_expr(expr.value.as_ref().unwrap(), Arc::clone(&schema))?;
@@ -6266,11 +6305,23 @@ mod tests {
 
     #[tokio::test]
     async fn explode_evaluates_array_once_per_batch() {
+        check_explode_evaluates_collection_once_per_batch(false).await;
+    }
+
+    #[tokio::test]
+    async fn explode_evaluates_map_once_per_batch() {
+        check_explode_evaluates_collection_once_per_batch(true).await;
+    }
+
+    async fn check_explode_evaluates_collection_once_per_batch(map: bool) {
+        use arrow::array::{AsArray, MapArray, StructArray};
         use arrow::datatypes::Int32Type;
         use datafusion::common::tree_node::{Transformed, TreeNode};
         use datafusion::logical_expr::{create_udf, Volatility};
         use datafusion::physical_plan::projection::ProjectionExec;
-        use spark_expression::data_type::{data_type_info::DatatypeStruct, DataTypeInfo, ListInfo};
+        use spark_expression::data_type::{
+            data_type_info::DatatypeStruct, DataTypeInfo, ListInfo, MapInfo,
+        };
 
         let array_type = spark_expression::DataType {
             type_id: 14,
@@ -6288,6 +6339,55 @@ mod tests {
             None,
             Some(vec![Some(20)]),
         ])) as ArrayRef;
+
+        let (array_type, arrays) = if map {
+            // Slice away a leading entry to exercise non-zero map offsets.
+            let values = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                Some(vec![Some(99)]),
+                Some(vec![Some(10), None]),
+                Some(vec![]),
+                None,
+                Some(vec![Some(20)]),
+            ])
+            .slice(1, 4);
+            let fields: Fields = vec![
+                Field::new("key", DataType::Int32, false)
+                    .with_metadata([("PARQUET:field_id".to_string(), "10".to_string())].into()),
+                Field::new("value", DataType::Int32, true)
+                    .with_metadata([("PARQUET:field_id".to_string(), "11".to_string())].into()),
+            ]
+            .into();
+            let entries = StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![99, 1, 2, 3])),
+                    Arc::clone(values.values()),
+                ],
+                None,
+            );
+            let maps = MapArray::new(
+                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                values.offsets().clone(),
+                entries,
+                values.nulls().cloned(),
+                false,
+            );
+            let map_type = spark_expression::DataType {
+                type_id: 15,
+                type_info: Some(Box::new(DataTypeInfo {
+                    datatype_struct: Some(DatatypeStruct::Map(Box::new(MapInfo {
+                        key_type: Some(Box::new(create_proto_datatype())),
+                        value_type: Some(Box::new(create_proto_datatype())),
+                        value_contains_null: true,
+                        key_field_id: Some(10),
+                        value_field_id: Some(11),
+                    }))),
+                })),
+            };
+            (map_type, Arc::new(maps) as ArrayRef)
+        } else {
+            (array_type, arrays)
+        };
 
         for outer in [false, true] {
             for position in [false, true] {
@@ -6376,7 +6476,7 @@ mod tests {
                     );
                     assert_eq!(
                         projections,
-                        1 + usize::from(position && (outer || computed)),
+                        1 + usize::from(position && (outer || computed || map)),
                         "{context}"
                     );
                     let expected_values = if outer {
@@ -6396,6 +6496,23 @@ mod tests {
                         })
                         .collect();
                     assert_eq!(values, expected_values.repeat(2), "{context}");
+                    if map {
+                        let expected_keys = if outer {
+                            vec![Some(1), Some(2), None, None, Some(3)]
+                        } else {
+                            vec![Some(1), Some(2), Some(3)]
+                        };
+                        let keys: Vec<_> = results
+                            .iter()
+                            .flat_map(|batch| {
+                                batch
+                                    .column(batch.num_columns() - 2)
+                                    .as_primitive::<Int32Type>()
+                                    .iter()
+                            })
+                            .collect();
+                        assert_eq!(keys, expected_keys.repeat(2), "{context}");
+                    }
                     if position {
                         let expected_positions = if outer {
                             vec![Some(0), Some(1), None, None, Some(0)]
