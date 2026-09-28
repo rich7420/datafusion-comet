@@ -199,7 +199,6 @@ object CometMapFromArrays extends CometExpressionSerde[MapFromArrays] {
       inputs: Seq[Attribute],
       binding: Boolean): Option[ExprOuterClass.Expr] = {
     createBinaryExpr(
-      expr,
       IsNotNull(expr.left),
       IsNotNull(expr.right),
       inputs,
