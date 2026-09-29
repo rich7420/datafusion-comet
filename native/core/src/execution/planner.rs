@@ -146,12 +146,12 @@ use datafusion_comet_proto::{
     spark_partitioning::{partitioning::PartitioningStruct, Partitioning as SparkPartitioning},
 };
 use datafusion_comet_spark_expr::{
-    create_case_when, jvm_udf::JvmScalarUdfExpr, spark_in_list, ApproxPercentile, ArrayInsert, AtLeastNNonNulls, Avg,
-    AvgDecimal, Cast, CheckOverflow, Correlation, Covariance, CreateNamedStruct,
-    DecimalRescaleCheckOverflow, GetArrayStructFields, GetStructField, HllPlusPlus, HllSketchAgg,
-    HllUnionAgg, IfExpr, ListExtract, MaxMinBy, Mode, NormalizeNaNAndZero, Regr, RegrType,
-    SparkCastOptions, Stddev, SumDecimal, ToJson, UnboundColumn, Variance, WideDecimalBinaryExpr,
-    WideDecimalOp,
+    create_case_when, jvm_udf::JvmScalarUdfExpr, spark_in_list, ApproxPercentile, ArrayInsert,
+    AtLeastNNonNulls, Avg, AvgDecimal, Cast, CheckOverflow, Correlation, Covariance,
+    CreateNamedStruct, DecimalRescaleCheckOverflow, GetArrayStructFields, GetStructField,
+    HllPlusPlus, HllSketchAgg, HllUnionAgg, IfExpr, ListExtract, MaxMinBy, Mode,
+    NormalizeNaNAndZero, Regr, RegrType, SparkCastOptions, Stddev, SumDecimal, ToJson,
+    UnboundColumn, Variance, WideDecimalBinaryExpr, WideDecimalOp,
 };
 use itertools::Itertools;
 use jni::objects::{Global, JObject};
