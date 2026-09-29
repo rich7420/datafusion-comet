@@ -442,3 +442,7 @@ harness = false
 [[bench]]
 name = "at_least_n_non_nulls"
 harness = false
+
+[[bench]]
+name = "if_expr"
+harness = false
