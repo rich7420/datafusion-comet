@@ -141,6 +141,9 @@ impl PhysicalExpr for AtLeastNNonNulls {
                 result, None,
             ))));
         }
+        // Bitmap counters amortize their setup across a u64 (64 rows). Below one
+        // word, retain the row counter: small-batch measurements showed that the
+        // bit-plane allocation/setup costs more than it saves there.
         if batch.num_rows() < 64 {
             return self.evaluate_small_batch(batch);
         }
