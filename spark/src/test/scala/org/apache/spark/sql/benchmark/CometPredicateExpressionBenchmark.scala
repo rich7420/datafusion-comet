@@ -65,7 +65,7 @@ object CometPredicateExpressionBenchmark extends CometBenchmarkBase {
           s"CASE WHEN $bucket < $missing THEN NULL " + nan +
             s"ELSE cast(id + $i AS $kind) END AS c$i"
         }
-        spark.range(rows).selectExpr(fields: _*).write.parquet(dir.getCanonicalPath)
+        spark.range(rows.toLong).selectExpr(fields: _*).write.parquet(dir.getCanonicalPath)
         val key = CometConf.getExprEnabledConfigKey("AtLeastNNonNulls")
         val defaultModes = Seq(
           ("Comet native", true, true),
@@ -79,7 +79,7 @@ object CometPredicateExpressionBenchmark extends CometBenchmarkBase {
           val benchmark = new Benchmark(
             s"na.drop: $width $kind columns, $missing% NULL, $nanPercent% NaN, " +
               s"n=$threshold, consumed=$consumed",
-            rows,
+            rows.toLong,
             output = output)
           var expected: Option[Row] = None
           modes.foreach { case (name, comet, native) =>
