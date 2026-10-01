@@ -33,10 +33,10 @@ mod delta_scan;
 mod lance_scan;
 
 use crate::execution::operators::init_csv_datasource_exec;
-use crate::execution::operators::AlignedArrowStreamReader;
 use crate::execution::operators::DynamicFilterJoinExec;
 use crate::execution::operators::IcebergScanExec;
 use crate::execution::operators::IcebergWriteExec;
+use crate::execution::operators::TopKReaderFilterExec;
 use crate::execution::operators::{PartitionedRankLimitExec, WindowFnKind};
 use crate::execution::{
     expressions::list_positions::ListPositionsExpr,
@@ -55,7 +55,7 @@ use arrow::compute::CastOptions;
 use arrow::datatypes::{
     DataType, Field, FieldRef, Fields, Schema, TimeUnit, DECIMAL128_MAX_PRECISION,
 };
-use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use datafusion::functions_aggregate::bit_and_or_xor::{bit_and_udaf, bit_or_udaf, bit_xor_udaf};
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::functions_aggregate::min_max::max_udaf;
@@ -146,8 +146,8 @@ use datafusion_comet_proto::{
     spark_partitioning::{partitioning::PartitioningStruct, Partitioning as SparkPartitioning},
 };
 use datafusion_comet_spark_expr::{
-    create_case_when, jvm_udf::JvmScalarUdfExpr, spark_in_list, ApproxPercentile, ArrayInsert,
-    AtLeastNNonNulls, Avg, AvgDecimal, Cast, CheckOverflow, Correlation, Covariance,
+    create_case_when, jvm_udf::JvmScalarUdfExpr, normalize_floats, spark_in_list, ApproxPercentile,
+    ArrayInsert, AtLeastNNonNulls, Avg, AvgDecimal, Cast, CheckOverflow, Correlation, Covariance,
     CreateNamedStruct, DecimalRescaleCheckOverflow, GetArrayStructFields, GetStructField,
     HllPlusPlus, HllSketchAgg, HllUnionAgg, IfExpr, ListExtract, MaxMinBy, Mode,
     NormalizeNaNAndZero, Regr, RegrType, SparkCastOptions, Stddev, SumDecimal, ToJson,
@@ -1022,15 +1022,10 @@ impl PhysicalPlanner {
         input_schema: SchemaRef,
     ) -> Result<Arc<dyn PhysicalExpr>, ExecutionError> {
         let child = self.create_expr(spark_expr, Arc::clone(&input_schema))?;
-        let data_type = child.data_type(input_schema.as_ref())?;
-        // Spark may already have normalized a partition or join key.
-        if matches!(data_type, DataType::Float32 | DataType::Float64)
-            && child.downcast_ref::<NormalizeNaNAndZero>().is_none()
-        {
-            Ok(Arc::new(NormalizeNaNAndZero::new(data_type, child)))
-        } else {
-            Ok(child)
-        }
+        Ok(NormalizeNaNAndZero::wrap_if_needed(
+            child,
+            input_schema.as_ref(),
+        )?)
     }
 
     /// Only constant literals are supported as scan defaults.
@@ -1634,13 +1629,22 @@ impl PhysicalPlanner {
 
                 let fetch = sort.fetch.map(|num| num as usize);
 
-                let mut sort_exec: Arc<dyn ExecutionPlan> = Arc::new(
-                    SortExec::new(
-                        LexOrdering::new(exprs?).unwrap(),
-                        Arc::clone(&child.native_plan),
-                    )
-                    .with_fetch(fetch),
-                );
+                let sort_plan = SortExec::new(
+                    LexOrdering::new(exprs?).unwrap(),
+                    Arc::clone(&child.native_plan),
+                )
+                .with_fetch(fetch);
+                let mut sort_exec: Arc<dyn ExecutionPlan> = if sort.dynamic_filter_enabled {
+                    match TopKReaderFilterExec::try_new(
+                        &sort_plan,
+                        self.session_ctx.copied_config().options(),
+                    )? {
+                        Some(wrapper) => Arc::new(wrapper),
+                        None => Arc::new(sort_plan),
+                    }
+                } else {
+                    Arc::new(sort_plan)
+                };
 
                 if let Some(skip) = sort.skip.filter(|&n| n > 0).map(|n| n as usize) {
                     sort_exec = Arc::new(GlobalLimitExec::new(sort_exec, skip, None));
@@ -1866,7 +1870,7 @@ impl PhysicalPlanner {
 
                 // Consumes the first input source for the scan. The Java side passes an
                 // `org.apache.arrow.c.ArrowArrayStream` whose `memoryAddress` points at the C
-                // struct; native takes ownership via `AlignedArrowStreamReader::from_raw`.
+                // struct; native takes ownership via `ArrowArrayStreamReader::from_raw`.
                 let input_source = if self.exec_context_id == TEST_EXEC_CONTEXT_ID
                     && inputs.is_empty()
                 {
@@ -1878,7 +1882,7 @@ impl PhysicalPlanner {
                         jni_call!(env, arrow_array_stream(java_stream.as_obj()).memory_address() -> i64)
                     })?;
                     let reader = unsafe {
-                        AlignedArrowStreamReader::from_raw(address as *mut FFI_ArrowArrayStream)
+                        ArrowArrayStreamReader::from_raw(address as *mut FFI_ArrowArrayStream)
                     }
                     .map_err(|e| {
                         GeneralError(format!("Failed to import ArrowArrayStream from JVM: {e}"))
@@ -3712,7 +3716,7 @@ impl PhysicalPlanner {
                     .iter()
                     .map(|scalar_vec| {
                         ScalarValue::iter_to_array(scalar_vec.iter().cloned())
-                            .map(|array| NormalizeNaNAndZero::normalize_array(&array))
+                            .map(|array| normalize_floats(&array))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
