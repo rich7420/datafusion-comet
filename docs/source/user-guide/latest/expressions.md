@@ -126,12 +126,12 @@ The tables below list every Spark built-in expression with its current status.
 | `regr_avgx` | ✅ | — | Native: Spark rewrites to `Average` (tests in [#4551](https://github.com/apache/datafusion-comet/pull/4551)) |
 | `regr_avgy` | ✅ | — | Native: Spark rewrites to `Average` (tests in [#4551](https://github.com/apache/datafusion-comet/pull/4551)) |
 | `regr_count` | ✅ | — | Native: Spark rewrites to `Count` (tests in [#4551](https://github.com/apache/datafusion-comet/pull/4551)) |
-| `regr_intercept` | ✅ | Native | Falls back by default because the native merge of partial aggregates differs from Spark ([#6423](https://github.com/apache/datafusion-comet/issues/6423)); the native path is opt-in via `spark.comet.expression.RegrIntercept.allowIncompatible=true` |
-| `regr_r2` | ✅ | Native | Falls back by default because the native merge of partial aggregates differs from Spark ([#6423](https://github.com/apache/datafusion-comet/issues/6423)); the native path is opt-in via `spark.comet.expression.RegrR2.allowIncompatible=true` |
-| `regr_slope` | ✅ | Native | Falls back by default because the native merge of partial aggregates differs from Spark ([#6423](https://github.com/apache/datafusion-comet/issues/6423)); the native path is opt-in via `spark.comet.expression.RegrSlope.allowIncompatible=true` |
-| `regr_sxx` | ✅ | Native | Falls back by default because the native merge of partial aggregates differs from Spark ([#6423](https://github.com/apache/datafusion-comet/issues/6423)); the native path is opt-in via `spark.comet.expression.RegrReplacement.allowIncompatible=true` (Spark plans `regr_sxx` as `RegrReplacement`) |
-| `regr_sxy` | ✅ | Native | Falls back by default because the native merge of partial aggregates differs from Spark ([#6423](https://github.com/apache/datafusion-comet/issues/6423)); the native path is opt-in via `spark.comet.expression.RegrSXY.allowIncompatible=true` |
-| `regr_syy` | ✅ | Native | Falls back by default because the native merge of partial aggregates differs from Spark ([#6423](https://github.com/apache/datafusion-comet/issues/6423)); the native path is opt-in via `spark.comet.expression.RegrReplacement.allowIncompatible=true` (Spark plans `regr_syy` as `RegrReplacement`) |
+| `regr_intercept` | ✅ | Native |  |
+| `regr_r2` | ✅ | Native |  |
+| `regr_slope` | ✅ | Native |  |
+| `regr_sxx` | ✅ | Native |  |
+| `regr_sxy` | ✅ | Native |  |
+| `regr_syy` | ✅ | Native |  |
 | `skewness` | 🔜 | — | Not yet implemented natively |
 | `some` | ✅ | — |  |
 | `std` | ✅ | Native |  |
@@ -705,7 +705,7 @@ Comet also accelerates a number of Catalyst expressions that have no Spark SQL f
 - **Accessor expressions (subscript and field access, not functions):** struct field access (`col.field`), array element access (`arr[i]`), and map value access (`map[key]`).
 - **Internal decimal arithmetic:** `CheckOverflow`, `MakeDecimal`, and `UnscaledValue`, which the analyzer inserts around decimal operations.
 - **User-defined functions:** Scala UDFs registered through the DataFrame or SQL API.
-- **DataSource V2 catalog functions:** Iceberg's system functions `bucket`, `truncate`, `years`, `months`, `days`, and `hours` (for example `system.bucket(16, id)`) run natively; see [Iceberg system functions](iceberg.md#iceberg-system-functions).
+- **DataSource V2 catalog functions:** Iceberg's system functions `bucket`, `truncate`, `years`, `months`, `days`, and `hours` (for example `system.bucket(16, id)`) run natively; see [Iceberg system functions](iceberg.md#iceberg-system-functions). Other DataSource V2 catalog functions run in Spark.
 - **Lowered built-ins:** Spark lowers some built-in functions to `StaticInvoke` or `Invoke` calls. Those without a native mapping run through the JVM codegen dispatcher when their input and output types are supported.
 - **Structural expressions:** aliases, attribute references, literals, sort orders, and `CASE WHEN`.
 
