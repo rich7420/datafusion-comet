@@ -39,6 +39,7 @@ use crate::execution::operators::DynamicFilterJoinExec;
 use crate::execution::operators::IcebergScanExec;
 use crate::execution::operators::TopKReaderFilterExec;
 use crate::execution::{
+    expressions::map_entries::MapEntriesExpr,
     operators::{ExecutionError, ScanExec, ShuffleScanExec},
     planner::expression_registry::ExpressionRegistry,
     planner::operator_registry::OperatorRegistry,
@@ -81,7 +82,8 @@ use datafusion::{
     prelude::SessionContext,
 };
 use datafusion_comet_operators::{
-    CometFilterExec, ExpandExec, ExplodeExec, PartitionedRankLimitExec, SampleExec, WindowFnKind,
+    range_exec, CometFilterExec, ExpandExec, ExplodeExec, PartitionedRankLimitExec, SampleExec,
+    WindowFnKind,
 };
 use datafusion_comet_spark_expr::{
     create_comet_physical_fun, create_comet_physical_fun_with_eval_mode, BinaryOutputStyle,
@@ -141,9 +143,9 @@ use datafusion_comet_spark_expr::{
     create_case_when, create_if_expr, jvm_udf::JvmScalarUdfExpr, spark_in_list, ApproxPercentile,
     ArrayInsert, Avg, AvgDecimal, Cast, CheckOverflow, Correlation, Covariance, CreateNamedStruct,
     DecimalRescaleCheckOverflow, GetArrayStructFields, GetStructField, HllPlusPlus, HllSketchAgg,
-    HllUnionAgg, IfExpr, ListExtract, MaxMinBy, Mode, NormalizeNaNAndZero, Regr, RegrType,
-    SparkCastOptions, Stddev, SumDecimal, ToJson, UnboundColumn, Variance, WideDecimalBinaryExpr,
-    WideDecimalOp,
+    HllUnionAgg, IfExpr, ListExtract, MaxMinBy, Mode, NormalizeNaNAndZero, NormalizeNestedFloats,
+    Regr, RegrType, SparkCastOptions, Stddev, SumDecimal, ToJson, UnboundColumn, Variance,
+    WideDecimalBinaryExpr, WideDecimalOp,
 };
 use itertools::Itertools;
 use jni::objects::{Global, JObject};
@@ -996,16 +998,18 @@ impl PhysicalPlanner {
         }
     }
 
-    /// Normalize scalar floating-point comparison keys without changing output values.
-    /// Sort, Window, and WindowGroupLimit must use identical expressions so DataFusion
-    /// can recognize the ordering of window partition keys.
+    /// Normalize floating-point comparison keys without changing output values: a `FLOAT` or
+    /// `DOUBLE` key, and an array or struct key with a float at any depth, whose order Arrow
+    /// otherwise takes from the raw bits. Sort, Window, and WindowGroupLimit must use identical
+    /// expressions so DataFusion can recognize the ordering of window partition keys.
     fn create_normalized_key_expr(
         &self,
         spark_expr: &Expr,
         input_schema: SchemaRef,
     ) -> Result<Arc<dyn PhysicalExpr>, ExecutionError> {
         let child = self.create_expr(spark_expr, Arc::clone(&input_schema))?;
-        Ok(NormalizeNaNAndZero::wrap_if_needed(
+        let child = NormalizeNaNAndZero::wrap_if_needed(child, input_schema.as_ref())?;
+        Ok(NormalizeNestedFloats::wrap_if_needed(
             child,
             input_schema.as_ref(),
         )?)
@@ -1581,6 +1585,22 @@ impl PhysicalPlanner {
                     Arc::new(SparkPlan::new(spark_plan.plan_id, limit, vec![child])),
                 ))
             }
+            OpStruct::RangeScan(range) => {
+                // A leaf with no JVM input: each task produces its own partition of the range.
+                let range: Arc<dyn ExecutionPlan> = Arc::new(range_exec(
+                    range.start,
+                    range.step,
+                    range.num_elements,
+                    range.num_slices,
+                    self.partition,
+                    self.session_ctx.copied_config().batch_size(),
+                )?);
+                Ok((
+                    vec![],
+                    vec![],
+                    Arc::new(SparkPlan::new(spark_plan.plan_id, range, vec![])),
+                ))
+            }
             OpStruct::Sample(sample) => {
                 assert_eq!(children.len(), 1);
                 let (scans, shuffle_scans, child) =
@@ -1990,7 +2010,7 @@ impl PhysicalPlanner {
                 let (scans, shuffle_scans, child) =
                     self.create_plan(&children[0], inputs, partition_count)?;
 
-                // Create the expression for the array to explode
+                // Create the expression for the collection to explode
                 let child_expr = if let Some(child_expr) = &explode.child {
                     self.create_expr(child_expr, child.schema())?
                 } else {
@@ -2005,6 +2025,22 @@ impl PhysicalPlanner {
                     .expect("Failed to get field from child expression")
                     .name()
                     .to_string();
+
+                // Expose maps as List<Struct<key, value>>, sharing their entries buffers.
+                // Reuse the list path for outer rows, positions and bounded output batches,
+                // then flatten the entry struct into Spark's two output columns.
+                let map_fields = match child_expr.data_type(&child_schema)? {
+                    DataType::Map(entries, _) => match entries.data_type() {
+                        DataType::Struct(fields) => Some(fields.clone()),
+                        _ => unreachable!("Map entries must be a struct"),
+                    },
+                    _ => None,
+                };
+                let child_expr: Arc<dyn PhysicalExpr> = if map_fields.is_some() {
+                    Arc::new(MapEntriesExpr::new(child_expr))
+                } else {
+                    child_expr
+                };
 
                 // Both posexplode variants reference the array twice: once for positions
                 // and once for values. Materialize computed arrays so both references
@@ -2100,11 +2136,22 @@ impl PhysicalPlanner {
                     }
                 };
 
-                output_fields.push(Field::new(
-                    array_field.name(),
-                    element_type,
-                    true, // Element is nullable after unnesting
-                ));
+                let struct_unnests = if let Some(fields) = map_fields {
+                    output_fields.extend(fields.iter().map(|field| {
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_nullable(explode.outer || field.is_nullable())
+                    }));
+                    vec![array_input_index]
+                } else {
+                    output_fields.push(Field::new(
+                        array_field.name(),
+                        element_type,
+                        true, // Element is nullable after unnesting
+                    ));
+                    vec![]
+                };
 
                 let output_schema = Arc::new(Schema::new(output_fields));
 
@@ -2134,7 +2181,7 @@ impl PhysicalPlanner {
                 let unnest_exec = Arc::new(ExplodeExec::new(
                     project_exec,
                     list_unnests,
-                    vec![], // No struct columns to unnest
+                    struct_unnests,
                     output_schema,
                     unnest_options,
                 )?);
@@ -4950,6 +4997,38 @@ mod tests {
             .collect()
     }
 
+    /// `floating_sort_batches` with each key wrapped in a one-element list and in a one-field
+    /// struct, which have to order and tie exactly as the bare key does. A null key becomes a
+    /// null list or struct.
+    fn nested_floating_sort_batches() -> Vec<(i32, RecordBatch)> {
+        use arrow::array::StructArray;
+        use arrow::buffer::OffsetBuffer;
+        floating_sort_batches()
+            .into_iter()
+            .flat_map(|(type_id, batch)| {
+                let values = Arc::clone(batch.column(0));
+                let nulls = values.nulls().cloned();
+                let element = Field::new("item", values.data_type().clone(), true);
+                let list: ArrayRef = Arc::new(ListArray::new(
+                    Arc::new(element),
+                    OffsetBuffer::from_lengths(vec![1; values.len()]),
+                    Arc::clone(&values),
+                    nulls.clone(),
+                ));
+                let fields = Fields::from(vec![Field::new("v", values.data_type().clone(), true)]);
+                let record: ArrayRef = Arc::new(StructArray::new(fields, vec![values], nulls));
+                [list, record].into_iter().map(move |key| {
+                    let mut fields: Vec<FieldRef> = batch.schema().fields().to_vec();
+                    fields[0] = Arc::new(Field::new("ord", key.data_type().clone(), true));
+                    let mut columns = batch.columns().to_vec();
+                    columns[0] = key;
+                    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns);
+                    (type_id, batch.unwrap())
+                })
+            })
+            .collect()
+    }
+
     #[test]
     fn floating_window_partition_keys_preserve_ordering() {
         let planner = PhysicalPlanner::default();
@@ -5017,7 +5096,11 @@ mod tests {
     async fn floating_sort_keys_preserve_window_group_limit_peers() {
         let planner = PhysicalPlanner::default();
         let context = SessionContext::new_with_config(SessionConfig::new().with_batch_size(3));
-        for (type_id, batch) in floating_sort_batches() {
+        // Floats nested in a list or a struct must rank exactly as the bare floats do.
+        let batches = floating_sort_batches()
+            .into_iter()
+            .chain(nested_floating_sort_batches());
+        for (type_id, batch) in batches {
             for (descending, kind, fetch, expected) in [
                 (true, WindowFnKind::Rank, 3, vec![0, 1, 2, 8, 9]),
                 (true, WindowFnKind::DenseRank, 2, vec![0, 1, 2, 8, 9]),
@@ -5069,8 +5152,10 @@ mod tests {
                 }
                 ids.sort_unstable();
                 assert_eq!(
-                    ids, expected,
-                    "type={type_id}, descending={descending}, {kind:?}"
+                    ids,
+                    expected,
+                    "type={type_id}, key={}, descending={descending}, {kind:?}",
+                    batch.schema().field(0).data_type()
                 );
                 // The zero peer group and the second NaN peer group straddle size-3
                 // sort output batches. Tie state must survive those boundaries.
@@ -5608,11 +5693,23 @@ mod tests {
 
     #[tokio::test]
     async fn explode_evaluates_array_once_per_batch() {
+        check_explode_evaluates_collection_once_per_batch(false).await;
+    }
+
+    #[tokio::test]
+    async fn explode_evaluates_map_once_per_batch() {
+        check_explode_evaluates_collection_once_per_batch(true).await;
+    }
+
+    async fn check_explode_evaluates_collection_once_per_batch(map: bool) {
+        use arrow::array::{AsArray, MapArray, StructArray};
         use arrow::datatypes::Int32Type;
         use datafusion::common::tree_node::{Transformed, TreeNode};
         use datafusion::logical_expr::{create_udf, Volatility};
         use datafusion::physical_plan::projection::ProjectionExec;
-        use spark_expression::data_type::{data_type_info::DatatypeStruct, DataTypeInfo, ListInfo};
+        use spark_expression::data_type::{
+            data_type_info::DatatypeStruct, DataTypeInfo, ListInfo, MapInfo,
+        };
 
         let array_type = spark_expression::DataType {
             type_id: 14,
@@ -5630,6 +5727,55 @@ mod tests {
             None,
             Some(vec![Some(20)]),
         ])) as ArrayRef;
+
+        let (array_type, arrays) = if map {
+            // Slice away a leading entry to exercise non-zero map offsets.
+            let values = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                Some(vec![Some(99)]),
+                Some(vec![Some(10), None]),
+                Some(vec![]),
+                None,
+                Some(vec![Some(20)]),
+            ])
+            .slice(1, 4);
+            let fields: Fields = vec![
+                Field::new("key", DataType::Int32, false)
+                    .with_metadata([("PARQUET:field_id".to_string(), "10".to_string())].into()),
+                Field::new("value", DataType::Int32, true)
+                    .with_metadata([("PARQUET:field_id".to_string(), "11".to_string())].into()),
+            ]
+            .into();
+            let entries = StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![99, 1, 2, 3])),
+                    Arc::clone(values.values()),
+                ],
+                None,
+            );
+            let maps = MapArray::new(
+                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                values.offsets().clone(),
+                entries,
+                values.nulls().cloned(),
+                false,
+            );
+            let map_type = spark_expression::DataType {
+                type_id: 15,
+                type_info: Some(Box::new(DataTypeInfo {
+                    datatype_struct: Some(DatatypeStruct::Map(Box::new(MapInfo {
+                        key_type: Some(Box::new(create_proto_datatype())),
+                        value_type: Some(Box::new(create_proto_datatype())),
+                        value_contains_null: true,
+                        key_field_id: Some(10),
+                        value_field_id: Some(11),
+                    }))),
+                })),
+            };
+            (map_type, Arc::new(maps) as ArrayRef)
+        } else {
+            (array_type, arrays)
+        };
 
         for outer in [false, true] {
             for position in [false, true] {
@@ -5709,20 +5855,21 @@ mod tests {
                     let results = collect(native_plan.execute(0, task_ctx).unwrap())
                         .await
                         .unwrap();
-                    let context =
-                        format!("outer={outer}, position={position}, computed={computed}");
+                    let context = format!(
+                        "outer={outer}, position={position}, computed={computed}, map={map}"
+                    );
                     assert_eq!(
                         calls.load(Ordering::Relaxed),
                         if computed { 2 } else { 0 },
                         "{context}"
                     );
                     // The array is pre-projected only to share one evaluation between the
-                    // `pos` and `value` references, so only a computed child needs it. `outer`
+                    // `pos` and `value` references, so a computed child or map wrapper needs it. `outer`
                     // does not, since it is now a `UnnestOptions` mode rather than a wrapper
                     // expression around the child.
                     assert_eq!(
                         projections,
-                        1 + usize::from(position && computed),
+                        1 + usize::from(position && (computed || map)),
                         "{context}"
                     );
                     let expected_values = if outer {
@@ -5742,6 +5889,23 @@ mod tests {
                         })
                         .collect();
                     assert_eq!(values, expected_values.repeat(2), "{context}");
+                    if map {
+                        let expected_keys = if outer {
+                            vec![Some(1), Some(2), None, None, Some(3)]
+                        } else {
+                            vec![Some(1), Some(2), Some(3)]
+                        };
+                        let keys: Vec<_> = results
+                            .iter()
+                            .flat_map(|batch| {
+                                batch
+                                    .column(batch.num_columns() - 2)
+                                    .as_primitive::<Int32Type>()
+                                    .iter()
+                            })
+                            .collect();
+                        assert_eq!(keys, expected_keys.repeat(2), "{context}");
+                    }
                     if position {
                         let expected_positions = if outer {
                             vec![Some(0), Some(1), None, None, Some(0)]
