@@ -75,6 +75,10 @@ name = "hash"
 harness = false
 
 [[bench]]
+name = "decimal_hash"
+harness = false
+
+[[bench]]
 name = "hash_alloc"
 harness = false
 
@@ -344,6 +348,22 @@ harness = false
 
 [[bench]]
 name = "abs"
+harness = false
+
+[[bench]]
+name = "sqrt"
+harness = false
+
+[[bench]]
+name = "concat_ws"
+harness = false
+
+[[bench]]
+name = "list_positions"
+harness = false
+
+[[bench]]
+name = "map_from_arrays"
 harness = false
 
 [[bench]]

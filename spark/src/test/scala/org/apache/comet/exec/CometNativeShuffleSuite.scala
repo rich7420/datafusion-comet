@@ -39,13 +39,14 @@ import org.apache.spark.sql.{CometTestBase, DataFrame, Dataset, Row}
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
-import org.apache.spark.sql.comet.{CometExec, CometLocalTableScanExec, CometMetricNode, CometScanWrapper, CometSparkToColumnarExec, CometTakeOrderedAndProjectExec}
+import org.apache.spark.sql.comet.{CometExec, CometLocalTableScanExec, CometMetricNode, CometNativeScanExec, CometScanWrapper, CometSparkToColumnarExec, CometTakeOrderedAndProjectExec}
 import org.apache.spark.sql.comet.execution.arrow.CometArrowStream
-import org.apache.spark.sql.comet.execution.shuffle.{CometNativeShuffle, CometShuffleExchangeExec}
-import org.apache.spark.sql.execution.LocalTableScanExec
+import org.apache.spark.sql.comet.execution.shuffle.{CometColumnarShuffle, CometNativeShuffle, CometShuffleExchangeExec}
+import org.apache.spark.sql.execution.{FileSourceScanExec, LocalTableScanExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.functions.{col, count, sum}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, DataType, LongType, MapType, StructField, StructType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
@@ -771,6 +772,66 @@ class CometNativeShuffleSuite extends CometTestBase with AdaptiveSparkPlanHelper
     }
   }
 
+  test("native shuffle on wide decimal hash partitioning keys") {
+    withNestedHashPartitioning {
+      withTable("wide_decimals") {
+        sql("CREATE TABLE wide_decimals(id INT, c DECIMAL(38, 0)) USING parquet")
+        sql("""INSERT INTO wide_decimals VALUES (0, null), (1, 0), (2, 128), (3, -129),
+            (4, 99999999999999999999999999999999999999BD),
+            (5, -99999999999999999999999999999999999999BD), (6, 128)""")
+        Seq(Seq("c"), Seq("a"), Seq("s"), Seq("id", "c")).foreach { keys =>
+          def shuffled = sql("""SELECT id, c, array(c, c) AS a,
+              named_struct('d', c) AS s FROM wide_decimals""")
+            .repartition(10, keys.map(col): _*)
+          checkCometExchange(shuffled, 1, native = true)
+          // This pins the common hash helper's shuffle caller, including chained and nested
+          // inputs. The old fixed-width encoding produced different partition assignments.
+          checkSparkAnswer(shuffled.selectExpr("id", "spark_partition_id()"))
+          checkSparkAnswer(shuffled.groupBy("c").count())
+        }
+      }
+    }
+  }
+
+  test("wide decimal joins keep native and Spark shuffle inputs copartitioned") {
+    withSQLConf(
+      CometConf.COMET_NATIVE_SCAN_ENABLED.key -> "true",
+      CometConf.COMET_CONVERT_FROM_JSON_ENABLED.key -> "false",
+      SQLConf.USE_V1_SOURCE_LIST.key -> "parquet,json",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "7",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.COALESCE_PARTITIONS_ENABLED.key -> "false") {
+      withTable("decimal_native", "decimal_spark") {
+        Seq("decimal_native" -> "parquet", "decimal_spark" -> "json").foreach {
+          case (table, format) =>
+            sql(s"CREATE TABLE $table(id INT, k DECIMAL(38, 0)) USING $format")
+            sql(s"""INSERT INTO $table VALUES (1, 1), (2, -1), (3, 128), (4, -129),
+                (5, 99999999999999999999999999999999999999BD),
+                (6, -99999999999999999999999999999999999999BD)""")
+        }
+        for (mode <- Seq("native", "auto"); adaptive <- Seq(false, true)) {
+          withSQLConf(
+            CometConf.COMET_SHUFFLE_MODE.key -> mode,
+            SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> adaptive.toString) {
+            val df = sql("""SELECT n.id, s.id FROM decimal_native n
+                JOIN decimal_spark s ON n.k = s.k""")
+            val (_, plan) = checkSparkAnswer(df)
+            val exchanges = collect(plan) { case e: CometShuffleExchangeExec => e }
+            assert(exchanges.count(_.shuffleType == CometNativeShuffle) == 1, plan.treeString)
+            if (mode == "auto") {
+              assert(exchanges.count(_.shuffleType == CometColumnarShuffle) == 1, plan.treeString)
+            } else {
+              assert(collect(plan) { case _: ShuffleExchangeExec => 1 }.sum == 1, plan.treeString)
+            }
+            assert(collect(plan) { case _: CometNativeScanExec => 1 }.sum == 1, plan.treeString)
+            assert(collect(plan) { case _: FileSourceScanExec => 1 }.sum == 1, plan.treeString)
+          }
+        }
+      }
+    }
+  }
+
   test("native shuffle on struct hash partitioning key") {
     withNestedHashPartitioning {
       Seq(10, 201).foreach { numPartitions =>
@@ -986,6 +1047,30 @@ class CometNativeShuffleSuite extends CometTestBase with AdaptiveSparkPlanHelper
       }
     }
   }
+  test("native shuffle on a float hash partitioning key matches Spark's partition assignment") {
+    // Spark hashes a float through doubleToLongBits or floatToIntBits, which canonicalize NaN.
+    // Negating a NaN in a native projection flips its sign bit, which gives the bits arithmetic
+    // produces on x86-64, and the native hash must still send the row where Spark sends it.
+    withParquetTable(
+      Seq(0.0, -0.0, Double.NaN, 1.5, -1.5).zipWithIndex.map { case (d, i) => (i, d, d.toFloat) },
+      "tbl") {
+      Seq("d", "nd", "nf", "nd, nf").foreach { keys =>
+        val repartitioned =
+          s"SELECT /*+ REPARTITION(10, $keys) */ _1, _2 AS d, -_2 AS nd, -_3 AS nf FROM tbl"
+        val query = s"SELECT _1, spark_partition_id() AS pid FROM ($repartitioned)"
+        val cometRows = sql(query).collect().map(r => (r.getInt(0), r.getInt(1))).sorted
+        // `SQLHelper.withSQLConf` returns Unit on Spark 3.x, so capture the rows via a var.
+        var sparkRows: Array[(Int, Int)] = Array.empty
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          sparkRows = sql(query).collect().map(r => (r.getInt(0), r.getInt(1))).sorted
+        }
+        assert(sparkRows.nonEmpty, "Spark produced no rows; the comparison would be vacuous")
+        checkCometExchange(sql(repartitioned), 1, true)
+        assert(cometRows === sparkRows, s"partition assignment differs from Spark for ($keys)")
+      }
+    }
+  }
+
   test("native shuffle on nested hash partitioning key with interval leaf falls back") {
     // CalendarIntervalType is allowed as a shuffle DATA column but the native hasher has no
     // branch for it (https://github.com/apache/datafusion-comet/issues/5059). Because the nested
