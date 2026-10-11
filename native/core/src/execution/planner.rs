@@ -39,6 +39,7 @@ use crate::execution::operators::DynamicFilterJoinExec;
 use crate::execution::operators::IcebergScanExec;
 use crate::execution::operators::TopKReaderFilterExec;
 use crate::execution::{
+    expressions::map_entries::MapEntriesExpr,
     operators::{
         ExecutionError, MergeActionContext, MergeInstructionExec, MergeRowsExec, ScanExec,
         ShuffleScanExec,
@@ -144,10 +145,10 @@ use datafusion_comet_proto::{
 use datafusion_comet_spark_expr::{
     create_case_when, create_if_expr, jvm_udf::JvmScalarUdfExpr, spark_in_list, ApproxPercentile,
     ArrayInsert, Avg, AvgDecimal, Cast, CheckOverflow, Correlation, Covariance, CreateNamedStruct,
-    DecimalRescaleCheckOverflow, GetArrayStructFields, GetStructField, HllPlusPlus, HllSketchAgg,
-    HllUnionAgg, IfExpr, ListExtract, MaxMinBy, Mode, NormalizeNaNAndZero, NormalizeNestedFloats,
-    Regr, RegrType, SparkCastOptions, SparkMinMax, Stddev, SumDecimal, ToJson, UnboundColumn,
-    Variance, WideDecimalBinaryExpr, WideDecimalOp,
+    DecimalRescaleCheckOverflow, FloatOperands, GetArrayStructFields, GetStructField, HllPlusPlus,
+    HllSketchAgg, HllUnionAgg, IfExpr, ListExtract, MaxMinBy, Mode, NormalizeNaNAndZero,
+    NormalizeNestedFloats, Regr, RegrType, SparkCastOptions, SparkMinMax, Stddev, SumDecimal,
+    ToJson, UnboundColumn, Variance, WideDecimalBinaryExpr, WideDecimalOp,
 };
 use itertools::Itertools;
 use jni::objects::{Global, JObject};
@@ -325,6 +326,7 @@ pub struct BinaryExprOptions {
 pub const TEST_EXEC_CONTEXT_ID: i64 = -1;
 
 /// The query planner for converting Spark query plans to DataFusion query plans.
+#[derive(Clone)]
 pub struct PhysicalPlanner {
     // The execution context id of this planner.
     exec_context_id: i64,
@@ -346,6 +348,9 @@ pub struct PhysicalPlanner {
     /// Task-owned destination for remote shuffle blocks, registered on the driving Spark task
     /// thread before native planning. Only explicit RSS destinations may use it.
     shuffle_partition_pusher: Option<Arc<dyn ShufflePartitionPusher>>,
+    /// How comparisons treat floating-point operands. `Raw` only while planning a scan's data
+    /// filters; see [`Self::create_data_filter`].
+    float_operands: FloatOperands,
 }
 
 impl Default for PhysicalPlanner {
@@ -365,6 +370,7 @@ impl PhysicalPlanner {
             task_context: None,
             class_loader: None,
             shuffle_partition_pusher: None,
+            float_operands: FloatOperands::Normalize,
         }
     }
 
@@ -475,6 +481,11 @@ impl PhysicalPlanner {
     ) -> Self {
         self.shuffle_partition_pusher = shuffle_partition_pusher;
         self
+    }
+
+    /// How comparisons treat floating-point operands.
+    pub fn float_operands(&self) -> FloatOperands {
+        self.float_operands
     }
 
     /// Return session context of this planner.
@@ -700,7 +711,6 @@ impl PhysicalPlanner {
                     SparkCastOptions::new_with_version(
                         eval_mode,
                         &expr.timezone,
-                        expr.allow_incompat,
                         expr.is_spark4_plus,
                     ),
                     spark_expr.expr_id,
@@ -793,7 +803,7 @@ impl PhysicalPlanner {
                     "md5" => Ok(Arc::new(Cast::new(
                         func?,
                         DataType::Utf8,
-                        SparkCastOptions::new_without_timezone(EvalMode::Try, true),
+                        SparkCastOptions::new_without_timezone(EvalMode::Try),
                         None,
                         None,
                     ))),
@@ -915,8 +925,7 @@ impl PhysicalPlanner {
                 )))
             }
             ExprStruct::ToPrettyString(expr) => {
-                let mut spark_cast_options =
-                    SparkCastOptions::new(EvalMode::Try, &expr.timezone, true);
+                let mut spark_cast_options = SparkCastOptions::new(EvalMode::Try, &expr.timezone);
                 let null_string = "NULL";
                 spark_cast_options.null_string = null_string.to_string();
                 spark_cast_options.binary_output_style =
@@ -1045,6 +1054,8 @@ impl PhysicalPlanner {
                     udf.return_nullable,
                     self.task_context.clone(),
                     self.class_loader.clone(),
+                    self.partition,
+                    self.exec_context_id,
                 )))
             }
             ExprStruct::NativeScalarUdf(call) => {
@@ -1124,6 +1135,45 @@ impl PhysicalPlanner {
                 Ok(expr)
             }
             expr => Err(GeneralError(format!("Not implemented: {expr:?}"))),
+        }
+    }
+
+    /// Create a data filter that a scan pushes into the Parquet reader, with float operands
+    /// treated as [`Self::data_filter_float_operands`] decides.
+    fn create_data_filter(
+        &self,
+        spark_expr: &Expr,
+        input_schema: SchemaRef,
+        float_operands: FloatOperands,
+    ) -> Result<Arc<dyn PhysicalExpr>, ExecutionError> {
+        let planner = Self {
+            float_operands,
+            ..self.clone()
+        };
+        planner.create_expr(spark_expr, input_schema)
+    }
+
+    /// How a scan's data filters treat float operands. The Parquet reader prunes row groups and
+    /// pages with them, and with row-level pushdown (`pushdown_filters`) it also drops the rows
+    /// they reject, which Spark's Filter above the scan then never sees.
+    ///
+    /// Without row-level pushdown the filters only prune, and pruning only recognizes a column
+    /// compared with a literal, so that shape stays a plain comparison of the raw column
+    /// ([`FloatOperands::Raw`]). With it, every float comparison follows Spark's ordering and
+    /// gives up pruning: a raw column would drop a stored NaN that Spark matches, such as one with
+    /// the sign bit set, which Arrow orders below every other value.
+    fn data_filter_float_operands(&self) -> FloatOperands {
+        if self
+            .session_ctx
+            .copied_config()
+            .options()
+            .execution
+            .parquet
+            .pushdown_filters
+        {
+            FloatOperands::Normalize
+        } else {
+            FloatOperands::Raw
         }
     }
 
@@ -1908,10 +1958,17 @@ impl PhysicalPlanner {
                                 .cloned()
                                 .collect::<Vec<FieldRef>>(),
                         ));
+                        let float_operands = self.data_filter_float_operands();
                         common
                             .data_filters
                             .iter()
-                            .map(|expr| self.create_expr(expr, Arc::clone(&filter_schema)))
+                            .map(|expr| {
+                                self.create_data_filter(
+                                    expr,
+                                    Arc::clone(&filter_schema),
+                                    float_operands,
+                                )
+                            })
                             .collect()
                     };
 
@@ -2328,7 +2385,7 @@ impl PhysicalPlanner {
                 let (scans, shuffle_scans, child) =
                     self.create_plan(&children[0], inputs, partition_count)?;
 
-                // Create the expression for the array to explode
+                // Create the expression for the collection to explode
                 let child_expr = if let Some(child_expr) = &explode.child {
                     self.create_expr(child_expr, child.schema())?
                 } else {
@@ -2343,6 +2400,22 @@ impl PhysicalPlanner {
                     .expect("Failed to get field from child expression")
                     .name()
                     .to_string();
+
+                // Expose maps as List<Struct<key, value>>, sharing their entries buffers.
+                // Reuse the list path for outer rows, positions and bounded output batches,
+                // then flatten the entry struct into Spark's two output columns.
+                let map_fields = match child_expr.data_type(&child_schema)? {
+                    DataType::Map(entries, _) => match entries.data_type() {
+                        DataType::Struct(fields) => Some(fields.clone()),
+                        _ => unreachable!("Map entries must be a struct"),
+                    },
+                    _ => None,
+                };
+                let child_expr: Arc<dyn PhysicalExpr> = if map_fields.is_some() {
+                    Arc::new(MapEntriesExpr::new(child_expr))
+                } else {
+                    child_expr
+                };
 
                 // Both posexplode variants reference the array twice: once for positions
                 // and once for values. Materialize computed arrays so both references
@@ -2438,11 +2511,22 @@ impl PhysicalPlanner {
                     }
                 };
 
-                output_fields.push(Field::new(
-                    array_field.name(),
-                    element_type,
-                    true, // Element is nullable after unnesting
-                ));
+                let struct_unnests = if let Some(fields) = map_fields {
+                    output_fields.extend(fields.iter().map(|field| {
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_nullable(explode.outer || field.is_nullable())
+                    }));
+                    vec![array_input_index]
+                } else {
+                    output_fields.push(Field::new(
+                        array_field.name(),
+                        element_type,
+                        true, // Element is nullable after unnesting
+                    ));
+                    vec![]
+                };
 
                 let output_schema = Arc::new(Schema::new(output_fields));
 
@@ -2472,7 +2556,7 @@ impl PhysicalPlanner {
                 let unnest_exec = Arc::new(ExplodeExec::new(
                     project_exec,
                     list_unnests,
-                    vec![], // No struct columns to unnest
+                    struct_unnests,
                     output_schema,
                     unnest_options,
                 )?);
@@ -5824,6 +5908,115 @@ mod tests {
         assert_eq!(0, filter_exec.additional_native_plans.len());
     }
 
+    /// Comparisons follow Spark's float ordering without normalizing their operands, except in the
+    /// data filters that a scan pushes into the Parquet reader, where pruning has to see a plain
+    /// comparison of the column.
+    #[test]
+    fn scan_data_filters_compare_float_columns_directly() {
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion_comet_spark_expr::SparkComparison;
+        let double = spark_expression::DataType {
+            type_id: 6,
+            type_info: None,
+        };
+        let operand = |expr_struct| Expr {
+            expr_struct: Some(expr_struct),
+            query_context: None,
+            expr_id: None,
+        };
+        let expr = operand(Gt(Box::new(spark_expression::BinaryExpr {
+            left: Some(Box::new(operand(Bound(spark_expression::BoundReference {
+                index: 0,
+                datatype: Some(double.clone()),
+            })))),
+            right: Some(Box::new(operand(Literal(spark_expression::Literal {
+                value: Some(literal::Value::DoubleVal(500.0)),
+                datatype: Some(double),
+                is_null: false,
+            })))),
+        })));
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Float64, true)]));
+        let planner = PhysicalPlanner::default();
+        let comparison = planner.create_expr(&expr, Arc::clone(&schema)).unwrap();
+        let comparison = comparison
+            .downcast_ref::<SparkComparison>()
+            .expect("a Spark comparison");
+        assert!(comparison.left().downcast_ref::<Column>().is_some());
+        let data_filter = planner
+            .create_data_filter(&expr, schema, planner.data_filter_float_operands())
+            .unwrap();
+        let data_filter = data_filter
+            .downcast_ref::<BinaryExpr>()
+            .expect("a plain comparison");
+        assert!(data_filter.left().downcast_ref::<Column>().is_some());
+    }
+
+    /// With row-level pushdown the Parquet reader drops the rows a data filter rejects, so the
+    /// filter compares the column in Spark's ordering rather than as it is. A raw column would drop
+    /// a stored NaN whose bits differ from the normalized literal, and a stored NaN with the sign
+    /// bit set under any ordering comparison, both of which Spark matches.
+    #[test]
+    fn scan_data_filters_follow_spark_ordering_with_row_level_pushdown() {
+        use arrow::array::{AsArray, BooleanArray};
+        use datafusion_comet_spark_expr::{FloatOperands, SparkComparison};
+        let double = spark_expression::DataType {
+            type_id: 6,
+            type_info: None,
+        };
+        let operand = |expr_struct| Expr {
+            expr_struct: Some(expr_struct),
+            query_context: None,
+            expr_id: None,
+        };
+        let column_and = |value: f64| {
+            Box::new(spark_expression::BinaryExpr {
+                left: Some(Box::new(operand(Bound(spark_expression::BoundReference {
+                    index: 0,
+                    datatype: Some(double.clone()),
+                })))),
+                right: Some(Box::new(operand(Literal(spark_expression::Literal {
+                    value: Some(literal::Value::DoubleVal(value)),
+                    datatype: Some(double.clone()),
+                    is_null: false,
+                })))),
+            })
+        };
+        // Spark folds `-double('NaN')` into a literal with the sign bit set.
+        let negative_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![
+                negative_nan,
+                f64::NAN,
+                1.0,
+            ]))],
+        )
+        .unwrap();
+        let config =
+            SessionConfig::new().set_bool("datafusion.execution.parquet.pushdown_filters", true);
+        let planner = PhysicalPlanner::new(Arc::new(SessionContext::new_with_config(config)), 0);
+        assert_eq!(
+            planner.data_filter_float_operands(),
+            FloatOperands::Normalize
+        );
+        for (expr, expected) in [
+            (operand(Eq(column_and(negative_nan))), [true, true, false]),
+            (operand(Gt(column_and(0.0))), [true, true, true]),
+        ] {
+            let data_filter = planner
+                .create_data_filter(
+                    &expr,
+                    Arc::clone(&schema),
+                    planner.data_filter_float_operands(),
+                )
+                .unwrap();
+            assert!(data_filter.downcast_ref::<SparkComparison>().is_some());
+            let matched = data_filter.evaluate(&batch).unwrap().into_array(3).unwrap();
+            assert_eq!(matched.as_boolean(), &BooleanArray::from(expected.to_vec()));
+        }
+    }
+
     #[test]
     fn spark_plan_metrics_hash_join() {
         let op_scan = create_scan();
@@ -6277,11 +6470,23 @@ mod tests {
 
     #[tokio::test]
     async fn explode_evaluates_array_once_per_batch() {
+        check_explode_evaluates_collection_once_per_batch(false).await;
+    }
+
+    #[tokio::test]
+    async fn explode_evaluates_map_once_per_batch() {
+        check_explode_evaluates_collection_once_per_batch(true).await;
+    }
+
+    async fn check_explode_evaluates_collection_once_per_batch(map: bool) {
+        use arrow::array::{AsArray, MapArray, StructArray};
         use arrow::datatypes::Int32Type;
         use datafusion::common::tree_node::{Transformed, TreeNode};
         use datafusion::logical_expr::{create_udf, Volatility};
         use datafusion::physical_plan::projection::ProjectionExec;
-        use spark_expression::data_type::{data_type_info::DatatypeStruct, DataTypeInfo, ListInfo};
+        use spark_expression::data_type::{
+            data_type_info::DatatypeStruct, DataTypeInfo, ListInfo, MapInfo,
+        };
 
         let array_type = spark_expression::DataType {
             type_id: 14,
@@ -6299,6 +6504,55 @@ mod tests {
             None,
             Some(vec![Some(20)]),
         ])) as ArrayRef;
+
+        let (array_type, arrays) = if map {
+            // Slice away a leading entry to exercise non-zero map offsets.
+            let values = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                Some(vec![Some(99)]),
+                Some(vec![Some(10), None]),
+                Some(vec![]),
+                None,
+                Some(vec![Some(20)]),
+            ])
+            .slice(1, 4);
+            let fields: Fields = vec![
+                Field::new("key", DataType::Int32, false)
+                    .with_metadata([("PARQUET:field_id".to_string(), "10".to_string())].into()),
+                Field::new("value", DataType::Int32, true)
+                    .with_metadata([("PARQUET:field_id".to_string(), "11".to_string())].into()),
+            ]
+            .into();
+            let entries = StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![99, 1, 2, 3])),
+                    Arc::clone(values.values()),
+                ],
+                None,
+            );
+            let maps = MapArray::new(
+                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                values.offsets().clone(),
+                entries,
+                values.nulls().cloned(),
+                false,
+            );
+            let map_type = spark_expression::DataType {
+                type_id: 15,
+                type_info: Some(Box::new(DataTypeInfo {
+                    datatype_struct: Some(DatatypeStruct::Map(Box::new(MapInfo {
+                        key_type: Some(Box::new(create_proto_datatype())),
+                        value_type: Some(Box::new(create_proto_datatype())),
+                        value_contains_null: true,
+                        key_field_id: Some(10),
+                        value_field_id: Some(11),
+                    }))),
+                })),
+            };
+            (map_type, Arc::new(maps) as ArrayRef)
+        } else {
+            (array_type, arrays)
+        };
 
         for outer in [false, true] {
             for position in [false, true] {
@@ -6378,20 +6632,21 @@ mod tests {
                     let results = collect(native_plan.execute(0, task_ctx).unwrap())
                         .await
                         .unwrap();
-                    let context =
-                        format!("outer={outer}, position={position}, computed={computed}");
+                    let context = format!(
+                        "outer={outer}, position={position}, computed={computed}, map={map}"
+                    );
                     assert_eq!(
                         calls.load(Ordering::Relaxed),
                         if computed { 2 } else { 0 },
                         "{context}"
                     );
                     // The array is pre-projected only to share one evaluation between the
-                    // `pos` and `value` references, so only a computed child needs it. `outer`
+                    // `pos` and `value` references, so a computed child or map wrapper needs it. `outer`
                     // does not, since it is now a `UnnestOptions` mode rather than a wrapper
                     // expression around the child.
                     assert_eq!(
                         projections,
-                        1 + usize::from(position && computed),
+                        1 + usize::from(position && (computed || map)),
                         "{context}"
                     );
                     let expected_values = if outer {
@@ -6411,6 +6666,23 @@ mod tests {
                         })
                         .collect();
                     assert_eq!(values, expected_values.repeat(2), "{context}");
+                    if map {
+                        let expected_keys = if outer {
+                            vec![Some(1), Some(2), None, None, Some(3)]
+                        } else {
+                            vec![Some(1), Some(2), Some(3)]
+                        };
+                        let keys: Vec<_> = results
+                            .iter()
+                            .flat_map(|batch| {
+                                batch
+                                    .column(batch.num_columns() - 2)
+                                    .as_primitive::<Int32Type>()
+                                    .iter()
+                            })
+                            .collect();
+                        assert_eq!(keys, expected_keys.repeat(2), "{context}");
+                    }
                     if position {
                         let expected_positions = if outer {
                             vec![Some(0), Some(1), None, None, Some(0)]
@@ -6740,7 +7012,7 @@ mod tests {
                 .with_table_parquet_options(TableParquetOptions::new()),
         ) as Arc<dyn FileSource>;
 
-        let spark_parquet_options = SparkParquetOptions::new(EvalMode::Legacy, "UTC", false);
+        let spark_parquet_options = SparkParquetOptions::new(EvalMode::Legacy, "UTC");
 
         let expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory> = Arc::new(
             SparkPhysicalExprAdapterFactory::new(spark_parquet_options, None),

@@ -155,8 +155,8 @@ The tables below list every Spark built-in expression with its current status.
 | `array` | ✅ | Native |  |
 | `array_append` | ✅ | Native |  |
 | `array_compact` | ✅ | — |  |
-| `array_contains` | ✅ | Native | Float/double element arrays route through the JVM codegen dispatcher by default; the native path is opt-in via allowIncompatible |
-| `array_distinct` | ✅ | Native | Floating-point elements fall back on Spark versions other than 4.2.0; signed-zero and NaN results may differ with native opt-in ([details](compatibility/floating-point.md)) |
+| `array_contains` | ✅ | Hybrid | Flat float/double element arrays use a native kernel with Spark's equality; nested float elements, non-default string collations, and a value that is not a literal or column over a nullable array, route through the JVM codegen dispatcher |
+| `array_distinct` | ✅ | Native | Floating-point elements fall back on Spark versions other than 4.2.0; signed-zero and NaN results may differ with native opt-in ([details](compatibility/floating-point.md)). Non-default string collations fall back |
 | `array_except` | ✅ | Hybrid | Routes through the JVM codegen dispatcher by default; the incompatible native path is opt-in via allowIncompatible ([details](compatibility/expressions/array.md)) |
 | `array_insert` | ✅ | Native |  |
 | `array_intersect` | ✅ | Hybrid | Routes through the JVM codegen dispatcher by default; the incompatible native path is opt-in via allowIncompatible ([details](compatibility/expressions/array.md)) |
@@ -167,8 +167,8 @@ The tables below list every Spark built-in expression with its current status.
 | `array_prepend` | ✅ | — |  |
 | `array_remove` | ✅ | Native |  |
 | `array_repeat` | ✅ | Native |  |
-| `array_union` | ✅ | Native | Floating-point elements fall back on Spark versions other than 4.2.0; signed-zero and NaN results may differ with native opt-in ([details](compatibility/floating-point.md)) |
-| `arrays_overlap` | ✅ | Native |  |
+| `array_union` | ✅ | Native | Floating-point elements fall back on Spark versions other than 4.2.0; signed-zero and NaN results may differ with native opt-in ([details](compatibility/floating-point.md)). Non-default string collations fall back |
+| `arrays_overlap` | ✅ | Hybrid | Non-default string collations use the JVM codegen dispatcher |
 | `arrays_zip` | ✅ | Native |  |
 | `element_at` | ✅ | Native |  |
 | `flatten` | ✅ | Native | Binary/struct/map elements fall back |
@@ -336,8 +336,7 @@ The type-name conversion functions (`bigint`, `binary`, `boolean`, `date`, `deci
 ## generator_funcs
 
 `explode`, `explode_outer`, `posexplode`, and `posexplode_outer` are supported via
-`CometExplodeExec` (operator-level, not expression-level) for array input; map input falls back
-to Spark ([#2837](https://github.com/apache/datafusion-comet/issues/2837)). Enabled by default via
+`CometExplodeExec` for array and map inputs (operator-level, not expression-level). Enabled by default via
 `spark.comet.exec.explode.enabled`.
 
 | Function | Status | Implementation | Notes |
