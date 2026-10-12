@@ -34,6 +34,7 @@ import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStatistics, CatalogTable}
 import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Expression, ExpressionInfo, Hex, Literal}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateMode, BloomFilterAggregate, Final}
+import org.apache.spark.sql.catalyst.plans.logical.Expand
 import org.apache.spark.sql.comet._
 import org.apache.spark.sql.comet.execution.shuffle.{CometColumnarShuffle, CometNativeShuffle, CometShuffleExchangeExec}
 import org.apache.spark.sql.connector.catalog.InMemoryTableCatalog
@@ -51,7 +52,7 @@ import org.apache.spark.sql.internal.SQLConf.SESSION_LOCAL_TIMEZONE
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
-import org.apache.comet.{CometConf, CometExecIterator, ExtendedExplainInfo}
+import org.apache.comet.{CometConf, CometExecIterator, CometNativeException, ExtendedExplainInfo}
 import org.apache.comet.CometSparkSessionExtensions.{isSpark35Plus, isSpark40Plus, isSpark41Plus, isSpark42Plus}
 import org.apache.comet.rules.CometCoalesceShufflePartitions
 import org.apache.comet.serde.Config.ConfigMap
@@ -108,6 +109,57 @@ class CometExecSuite extends CometTestBase {
       val resolved = entries
       assert(resolved.get(CometConf.COMET_MAX_TEMP_DIRECTORY_SIZE.key) == "10737418240")
       flags.foreach(flag => assert(resolved.get(flag.key) == "true", flag.key))
+    }
+
+    // CometTestBase turns this one on, so it has no default to check here. An explicitly set
+    // value crosses verbatim, so only the resolved list turns `TRUE` into `true`.
+    withSQLConf(CometConf.COMET_STRICT_TIMESTAMP_LABELS.key -> "TRUE") {
+      assert(entries.get(CometConf.COMET_STRICT_TIMESTAMP_LABELS.key) == "true")
+    }
+  }
+
+  test("native sort spill files are compressed with the default spill codec") {
+    val numRows = 20000
+    val compressibleValue = "native-sort-spill-compression-" * 8
+    withTempPath { path =>
+      // A single input file keeps all rows in one task so its sort outgrows the tiny memory
+      // pool below and must spill.
+      spark
+        .createDataFrame((0 until numRows).map(i => (i, compressibleValue)))
+        .coalesce(1)
+        .write
+        .parquet(path.getAbsolutePath)
+
+      withParquetTable(path.getAbsolutePath, "tbl") {
+        def sortSpilledBytes(codecConf: (String, String)*): Long = {
+          var spilledBytes = 0L
+          withSQLConf(
+            Seq(
+              CometConf.COMET_BATCH_SIZE.key -> "1024",
+              CometConf.COMET_OFFHEAP_MEMORY_POOL_FRACTION.key -> "0.002",
+              CometConf.COMET_RESPECT_DATAFUSION_CONFIGS.key -> "true",
+              "spark.comet.datafusion.execution.sort_spill_reservation_bytes" -> "65536") ++
+              codecConf: _*) {
+            val sorted = sql("SELECT * FROM tbl").sortWithinPartitions($"_1".desc)
+            assert(sorted.collect().length == numRows)
+            val plan = sorted.queryExecution.executedPlan
+            val sorts = collect(plan) { case sort: CometSortExec => sort }
+            assert(sorts.nonEmpty, s"Expected a native sort:\n$plan")
+            spilledBytes = sorts.map(_.metrics("spilled_bytes").value).sum
+            assert(spilledBytes > 0L, "Native sort did not spill")
+          }
+          spilledBytes
+        }
+
+        // `spilled_bytes` counts what DataFusion wrote to disk, so this shows the default codec
+        // reaching DataFusion's spill writer, not just crossing JNI.
+        val uncompressed =
+          sortSpilledBytes(CometConf.COMET_EXEC_SPILL_COMPRESSION_CODEC.key -> "none")
+        val compressed = sortSpilledBytes()
+        assert(
+          compressed < uncompressed,
+          s"Spilled $compressed bytes with the default codec and $uncompressed with none")
+      }
     }
   }
 
@@ -1228,6 +1280,153 @@ class CometExecSuite extends CometTestBase {
           assert(
             cometSubqueries.nonEmpty,
             "Expected CometSubqueryBroadcastExec (DPP should be active, not TrueLiteral)")
+        }
+      }
+    }
+  }
+
+  // AQE runs CoalesceShufflePartitions before CometPlanAdaptiveDynamicPruningFilters. When that
+  // rule changes a stage, AQE validates the stage by reading outputPartitioning on every node in
+  // it. With Spark's UnionExec, the aggregate's shuffle read shares the final stage with the DPP
+  // scan and gets coalesced, so the scan is asked for its partitioning while its DPP subquery is
+  // still the adaptive placeholder. Answering must not run that subquery.
+  test("AQE DPP: shuffle coalescing in the scan's stage keeps DPP working") {
+    withTempDir { dir =>
+      val path = dir.getAbsolutePath
+      withSQLConf(CometConf.COMET_EXEC_ENABLED.key -> "false") {
+        spark
+          .range(100)
+          .selectExpr("cast(id % 10 as int) as store_id", "cast(id as int) as amount")
+          .write
+          .partitionBy("store_id")
+          .parquet(s"$path/fact")
+        spark
+          .range(10)
+          .selectExpr("cast(id as int) as store_id", "cast(id as string) as country")
+          .write
+          .parquet(s"$path/dim")
+        spark
+          .range(100)
+          .selectExpr("cast(id % 7 as int) as k", "cast(id as int) as v")
+          .write
+          .parquet(s"$path/other")
+      }
+
+      withSQLConf(
+        SQLConf.USE_V1_SOURCE_LIST.key -> "parquet",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+        SQLConf.COALESCE_PARTITIONS_ENABLED.key -> "true",
+        SQLConf.COALESCE_PARTITIONS_PARALLELISM_FIRST.key -> "false",
+        CometConf.COMET_EXEC_UNION_ENABLED.key -> "false") {
+        spark.read.parquet(s"$path/fact").createOrReplaceTempView("dpp_coalesce_fact")
+        spark.read.parquet(s"$path/dim").createOrReplaceTempView("dpp_coalesce_dim")
+        spark.read.parquet(s"$path/other").createOrReplaceTempView("dpp_coalesce_other")
+
+        val df = spark.sql("""SELECT f.amount AS a, f.store_id AS b
+            |FROM dpp_coalesce_fact f JOIN dpp_coalesce_dim d ON f.store_id = d.store_id
+            |WHERE d.country = '3'
+            |UNION ALL
+            |SELECT k AS a, CAST(count(*) AS INT) AS b
+            |FROM dpp_coalesce_other GROUP BY k""".stripMargin)
+        val (_, cometPlan) = checkSparkAnswer(df)
+
+        if (isSpark35Plus) {
+          val dppScans = collect(cometPlan) {
+            case s: CometNativeScanExec
+                if s.partitionFilters.exists(_.isInstanceOf[DynamicPruningExpression]) =>
+              s
+          }
+          assert(dppScans.size == 1, s"Expected one DPP native scan:\n${cometPlan.treeString}")
+          // The test only covers the bug if coalescing changed the stage holding the DPP scan.
+          // That is the final stage, and TreeNode.collect stops at its query stage leaves.
+          val finalStage = stripAQEPlan(cometPlan)
+          assert(
+            finalStage.find(_ eq dppScans.head).nonEmpty &&
+              finalStage.collect {
+                case r: AQEShuffleReadExec if r.isCoalescedRead => r
+              }.nonEmpty,
+            "Expected the DPP scan and a coalesced shuffle read in the final stage:\n" +
+              cometPlan.treeString)
+          assertAqeDppShape(cometPlan, expectedCometSubqueryBroadcasts = Some(1))
+          // The dimension filter keeps store 3 only, so DPP reads 1 of the 10 partitions.
+          assert(
+            dppScans.head.metrics("numPartitions").value == 1,
+            s"Expected DPP to prune to 1 partition:\n${cometPlan.treeString}")
+        }
+      }
+    }
+  }
+
+  // A bucketed scan reports its bucket layout, which DPP does not change. The sort-merge join on
+  // the bucket column keeps relying on it, so neither join side is shuffled, while DPP from the
+  // broadcast dimension join still prunes the fact table's partitions.
+  test("AQE DPP: bucketed scan keeps its partitioning for a sort-merge join") {
+    withTable("dpp_bucket_fact", "dpp_bucket_dim", "dpp_bucket_other") {
+      withSQLConf(CometConf.COMET_EXEC_ENABLED.key -> "false") {
+        spark
+          .range(100)
+          .selectExpr(
+            "cast(id % 10 as int) as store_id",
+            "cast(id % 7 as int) as k",
+            "cast(id as int) as amount")
+          .write
+          .partitionBy("store_id")
+          .bucketBy(4, "k")
+          .format("parquet")
+          .saveAsTable("dpp_bucket_fact")
+        spark
+          .range(10)
+          .selectExpr("cast(id as int) as store_id", "cast(id as string) as country")
+          .write
+          .format("parquet")
+          .saveAsTable("dpp_bucket_dim")
+        spark
+          .range(50)
+          .selectExpr("cast(id % 7 as int) as k", "cast(id as int) as v")
+          .write
+          .bucketBy(4, "k")
+          .format("parquet")
+          .saveAsTable("dpp_bucket_other")
+      }
+
+      withSQLConf(
+        SQLConf.USE_V1_SOURCE_LIST.key -> "parquet",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+        SQLConf.BUCKETING_ENABLED.key -> "true") {
+        val df = sql("""SELECT /*+ BROADCAST(d), MERGE(o) */ f.amount, f.store_id, o.v
+            |FROM dpp_bucket_fact f
+            |JOIN dpp_bucket_dim d ON f.store_id = d.store_id
+            |JOIN dpp_bucket_other o ON f.k = o.k
+            |WHERE d.country = '3'""".stripMargin)
+        val (_, cometPlan) = checkSparkAnswer(df)
+
+        val smjs = collect(cometPlan) {
+          case j: SortMergeJoinExec => j
+          case j: CometSortMergeJoinExec => j
+        }
+        assert(smjs.size == 1, s"Expected one sort-merge join:\n${cometPlan.treeString}")
+        val shuffles = collect(cometPlan) { case s: ShuffleExchangeLike => s }
+        assert(
+          shuffles.isEmpty,
+          s"Expected no shuffle around the bucketed join:\n${cometPlan.treeString}")
+
+        if (isSpark35Plus) {
+          val dppScans = collect(cometPlan) {
+            case s: CometNativeScanExec
+                if s.partitionFilters.exists(_.isInstanceOf[DynamicPruningExpression]) =>
+              s
+          }
+          assert(dppScans.size == 1, s"Expected one DPP native scan:\n${cometPlan.treeString}")
+          assert(
+            dppScans.head.bucketedScan,
+            s"Expected a bucketed scan:\n${cometPlan.treeString}")
+          assertAqeDppShape(cometPlan, expectedCometSubqueryBroadcasts = Some(1))
+          // The dimension filter keeps store 3 only, so DPP reads 1 of the 10 partitions.
+          assert(
+            dppScans.head.metrics("numPartitions").value == 1,
+            s"Expected DPP to prune to 1 partition:\n${cometPlan.treeString}")
         }
       }
     }
@@ -2854,6 +3053,14 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("expand operator with no output columns falls back to Spark") {
+    // Column pruning leaves this shape when nothing above the Expand reads its output.
+    val child = spark.range(3).queryExecution.analyzed
+    val expand = Expand(Seq(Seq.empty[Expression], Seq.empty[Expression]), Seq.empty, child)
+    val df = datasetOfRows(spark, expand).groupBy().count()
+    checkSparkAnswerAndFallbackReason(df, "Expand without output columns is not supported")
+  }
+
   test("multiple distinct multiple columns sets") {
     withTable("agg2") {
       val data2 = Seq[(Integer, Integer, Integer)](
@@ -3970,6 +4177,55 @@ class CometExecSuite extends CometTestBase {
       })
   }
 
+  // https://github.com/apache/datafusion-comet/issues/6234. The final TopK reads its child's
+  // batches through an Arrow C stream, and Arrow Java hands native only the text of an exception
+  // thrown while producing one. The first batch is read on the JVM to derive the stream's schema,
+  // so the overflow has to land past it: row 90000 of a single file, read by one task.
+  test("TakeOrderedAndProjectExec: an input error past the first batch keeps Spark's exception") {
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        spark
+          .range(0, 100000, 1, 1)
+          .selectExpr("CAST(id AS INT) AS id")
+          .write
+          .parquet(dir.getCanonicalPath)
+        spark.read.parquet(dir.getCanonicalPath).createOrReplaceTempView("overflow_src")
+        val df =
+          sql(s"SELECT id + ${Int.MaxValue - 90000} AS v FROM overflow_src ORDER BY v LIMIT 5")
+        checkSparkError(df, "ARITHMETIC_OVERFLOW")
+      }
+    }
+  }
+
+  // https://github.com/apache/datafusion-comet/issues/6234. CometSparkToColumnarExec exports its
+  // rows to native without reading a batch on the JVM first, so even an exception thrown for the
+  // first batch reached the user only as the text inside a CometNativeException.
+  test("SparkToColumnar keeps the exception its row input throws") {
+    val rows = spark.sparkContext.parallelize(1 to 10, 1).map { i =>
+      if (i == 5) throw new IllegalStateException("injected row input failure")
+      Row(i)
+    }
+    val df = spark
+      .createDataFrame(rows, StructType(Seq(StructField("a", IntegerType))))
+      .groupBy()
+      .sum("a")
+    assert(
+      collect(df.queryExecution.executedPlan) { case c: CometSparkToColumnarExec => c }.nonEmpty,
+      "expected the rows to reach native through CometSparkToColumnarExec:\n" +
+        df.queryExecution.executedPlan)
+
+    val (sparkError, cometError) = checkSparkAnswerMaybeThrows(df)
+    def injected(error: Option[Throwable], engine: String): (Class[_], Int) = {
+      val chain = causeChain(error.getOrElse(fail(s"$engine did not fail")))
+      assert(!chain.exists(_.isInstanceOf[CometNativeException]), s"$engine: ${chain.head}")
+      val depth = chain.indexWhere(t =>
+        t.isInstanceOf[IllegalStateException] && t.getMessage == "injected row input failure")
+      assert(depth >= 0, s"$engine did not surface the injected failure: ${chain.head}")
+      (chain.head.getClass, depth)
+    }
+    assert(injected(cometError, "Comet") == injected(sparkError, "Spark"))
+  }
+
   // Arrow Java ignores ArrowArray.offset on import, and a sliced boolean is the one array arrow-rs
   // exports with a non-zero offset, so native has to zero it at every level, not only the top.
   // https://github.com/apache/datafusion-comet/issues/6288
@@ -4606,6 +4862,52 @@ class CometExecSuite extends CometTestBase {
           case s: CometSparkToColumnarExec => s
         }
         assert(sparkToColumnar.nonEmpty, "Expected CometSparkToColumnarExec in the executed plan")
+      }
+    }
+  }
+
+  // https://github.com/apache/datafusion-comet/issues/6573
+  private val inputFileColumns =
+    Seq("input_file_name()", "input_file_block_start()", "input_file_block_length()", "id")
+  private val inputFileFallbackReason =
+    "Spark to Arrow conversion is not compatible with input_file_name"
+
+  test("input_file_name above a converted Spark file scan keeps the scan on Spark") {
+    for (format <- Seq("parquet", "csv", "json"); v1List <- Seq("", format)) {
+      withTempPath { dir =>
+        spark.range(9000).repartition(3).write.format(format).save(dir.toString)
+        withSQLConf(
+          SQLConf.USE_V1_SOURCE_LIST.key -> v1List,
+          CometConf.COMET_CONVERT_FROM_PARQUET_ENABLED.key -> "true",
+          CometConf.COMET_CONVERT_FROM_CSV_ENABLED.key -> "true",
+          CometConf.COMET_CONVERT_FROM_JSON_ENABLED.key -> "true") {
+          // The filter would run in Comet above the conversion. Without a Comet operator there,
+          // Comet drops the conversion and Spark's project reads the scan directly.
+          val df = spark.read
+            .schema("id LONG")
+            .format(format)
+            .load(dir.toString)
+            .where("id >= 0")
+            .selectExpr(inputFileColumns: _*)
+          val (_, cometPlan) = checkSparkAnswerAndFallbackReason(df, inputFileFallbackReason)
+          assert(collect(cometPlan) { case c: CometSparkToColumnarExec => c }.isEmpty)
+        }
+      }
+    }
+  }
+
+  test("input_file_name above a converted RDD scan keeps the scan on Spark") {
+    withTempPath { dir =>
+      spark.range(9000).repartition(3).selectExpr("CAST(id AS STRING)").write.text(dir.toString)
+      withSQLConf(CometConf.COMET_CONVERT_FROM_RDD_ENABLED.key -> "true") {
+        // HadoopRDD sets the file Spark evaluates input_file_name against, as FileScanRDD does.
+        val rows = spark.sparkContext.textFile(dir.toString).map(line => Row(line.toLong))
+        val df = spark
+          .createDataFrame(rows, new StructType().add("id", LongType))
+          .where("id >= 0")
+          .selectExpr(inputFileColumns: _*)
+        val (_, cometPlan) = checkSparkAnswerAndFallbackReason(df, inputFileFallbackReason)
+        assert(collect(cometPlan) { case c: CometSparkToColumnarExec => c }.isEmpty)
       }
     }
   }
