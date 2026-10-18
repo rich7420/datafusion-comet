@@ -1922,12 +1922,8 @@ object CometExplodeExec extends CometOperatorSerde[GenerateExec] {
       return Unsupported(Some(s"Unsupported generator: ${op.generator.nodeName}"))
     }
     op.generator.children.head.dataType match {
-      case _: ArrayType =>
+      case _: ArrayType | _: MapType =>
         Compatible()
-      case _: MapType =>
-        // TODO add support for map types
-        // https://github.com/apache/datafusion-comet/issues/2837
-        Unsupported(Some("Comet only supports explode/explode_outer for arrays, not maps"))
       case other =>
         Unsupported(Some(s"Unsupported data type: $other"))
     }
@@ -2850,6 +2846,18 @@ trait CometHashJoin {
       withFallbackReason(
         join,
         "null-aware anti-join requires single-column LeftAnti BuildRight with no condition")
+      return None
+    }
+
+    // DataFusion builds a null-aware anti join on Spark's streamed side, and on its hash map path
+    // it emits the build batches last to first, so the output loses the ordering Spark reports
+    // for the join. Remove this fallback once Comet uses a DataFusion release that fixes
+    // https://github.com/apache/datafusion/issues/26226.
+    if (isNullAwareAntiJoin && join.outputOrdering.nonEmpty) {
+      withFallbackReason(
+        join,
+        "null-aware anti-join over an ordered streamed side is not supported natively, " +
+          "because the native join does not keep that order")
       return None
     }
 
