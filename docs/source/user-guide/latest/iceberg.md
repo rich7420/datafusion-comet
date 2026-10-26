@@ -122,8 +122,29 @@ The native Iceberg reader supports the following features:
 
 NULL checks on struct, array, and map columns still use native scans and return correct
 results, but are not pushed into iceberg-rust, which binds accessors only for primitive fields.
-These residuals provide no native row-group pruning, nor do conjunctions containing them;
-safe partial pruning is tracked in [#5883](https://github.com/apache/datafusion-comet/issues/5883).
+These null checks are not pushed, but the other predicates in a positive conjunction still are.
+iceberg-rust uses a pushed predicate to skip row groups and pages and to filter rows during
+decode, and the filter above the scan evaluates the complete condition. `OR` is pushed only when
+both branches can be, and `NOT` only when its whole child can be.
+
+Partial pushdown is enabled by default. Set
+`spark.comet.scan.icebergNative.partialPushdown.enabled=false` to push only conditions that
+convert in full. This can help when most rows match and reader filtering adds work without
+skipping reads. The filter above the scan evaluates the complete condition with either setting.
+
+Some predicates are left to the filter above the scan because iceberg-rust would return
+different rows than Spark:
+
+- Range comparisons on `FLOAT` and `DOUBLE` columns, and comparisons with `0.0`, `-0.0` or NaN.
+- `NOT` over equality on a nullable column, as in `NOT (id <=> 1)`, unless it is ANDed with an
+  `IS NOT NULL` check on that column, written in the query or inferred by Spark as for `b = false`.
+  `!=` reaches iceberg-rust as a separate comparison and is not affected.
+- Comparisons other than `=` on a column whose type was promoted. This applies to every `BIGINT`
+  and `DOUBLE` column when only part of a condition is pushed, or when expiring snapshots removed
+  older schemas.
+
+Tables with a `schema.name-mapping.default` property push a condition only when all of it can be
+pushed.
 
 **Partitioning:**
 
@@ -221,6 +242,14 @@ The following scenarios will fall back to the JVM Iceberg reader:
   or renamed. The native reader cannot yet match such a field to data files written before the
   change. The check uses the table's schema history, so the fallback stays after those files are
   rewritten
+- Scans that read a struct, array, or map column from a table with
+  `schema.name-mapping.default`, including tables imported with `snapshot`, `migrate`, or
+  `add_files` ([#6790](https://github.com/apache/datafusion-comet/issues/6790)). The native reader
+  does not apply name mappings to nested fields. Queries that read only primitive columns can
+  still run natively. The fallback remains while the property is set, even if the data files
+  have since been rewritten with field IDs. Iceberg's nullness rules are separate from the
+  Parquet legacy setting; [#6934](https://github.com/apache/datafusion-comet/issues/6934) tracks
+  the reader update and review of this fallback
 - Scans where no schema in the table's history gives a partition source or equality-delete key a
   name that the scan's other columns don't use (every task of a native scan must give such a
   column the same name)
@@ -792,15 +821,19 @@ Which entries apply depends on which native paths are enabled:
 
 ### Reads that differ from Spark
 
-- **Migrated tables that use a name mapping.** The `migrate`, `snapshot` and `add_files`
-  procedures set `schema.name-mapping.default` for files without Iceberg field ids. When a query
-  also reads a top-level primitive column, the native scan returns NULL for nested fields (struct
-  fields, list elements and map values). Filters on those fields then select the wrong rows
-  ([#6790](https://github.com/apache/datafusion-comet/issues/6790)). The fix needs an iceberg-rust
-  upgrade ([#6934](https://github.com/apache/datafusion-comet/issues/6934)).
 - **Data files with neither field ids nor a name mapping.** Spark reads every nested field of such
   a file as NULL, and the native scan returns the values stored in the file
   ([#6794](https://github.com/apache/datafusion-comet/issues/6794)).
+- **Data files that store a narrower type than their column.** Files written before a type
+  promotion, such as `INT` to `BIGINT`, keep the older type, and files imported by `add_files`,
+  `migrate` or `snapshot` can store any narrower type. iceberg-rust compares such a file with a
+  filter literal incorrectly, so comparisons other than `=` pushed to the native scan can drop
+  matching rows. Comet avoids this for promotions that the schema history records. When only part
+  of a condition is pushed, it also avoids this for promotions made before Iceberg 0.12 and for
+  tables with a name mapping, which those procedures set. A condition that converts in full can
+  still drop rows from imported narrower files, even on a table with a name mapping, or from
+  columns promoted before Iceberg 0.12
+  ([#7138](https://github.com/apache/datafusion-comet/issues/7138)).
 - **`VERSION AS OF` reads of a column renamed after the snapshot.** The renamed column reads as
   NULL, and two columns that swapped names return each other's values
   ([#6822](https://github.com/apache/datafusion-comet/issues/6822)).
