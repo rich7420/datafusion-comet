@@ -30,13 +30,58 @@ is in [RESULTS.md](RESULTS.md), and the prototype comparison is in
 Comet shuffle is disabled explicitly to isolate partition-local sort while using
 Spark's default shuffle manager for the short aggregate.
 
+## Observed results
+
+In the second round, a short task submitted immediately after cancellation waited
+for the following task-launch notifications. All runs used the same probe, data,
+and resource configuration; debug tracing was off.
+
+| Variant | Runs | Short submission to task-launch notification |
+| --- | ---: | ---: |
+| Unchanged engine | 1 | 7.415 s |
+| A: Spark interruption checks around JNI | 2 | 8.572–9.324 s |
+| B: A plus a native cancellation token and 25 ms watcher | 2 | 23.226 ms, 1.820 s |
+| Spark reference | 1 | 68.016 ms |
+
+A separate slow B diagnostic run returned from both `executePlan` calls within
+27.3 ms after cancellation, but the subsequent `releasePlan` calls took
+1.471–1.482 s. The short task's admission took 1.502 s. This locates the residual
+delay inside the native cleanup call; it does not identify which cleanup step
+dominates. A fast diagnostic run completed both release calls by 25.8 ms.
+
+These are small constructed cases. The short query reuses warmed shuffle output,
+so the observation concerns one result task's admission. Task-launch times include
+listener notification delay. Normal-query watcher overhead, natural workload
+impact, exact native compute-stop time and physical memory reuse are unmeasured.
+The prototype has only been exercised locally with Spark 4.1.3, not across all
+supported Spark profiles or the full Spark SQL suite.
+
+See [the first report](RESULTS.md), [the prototype comparison](PHASE2-RESULTS.md),
+and [raw evidence and reproducer patches](evidence.zip). The archive includes the
+original 14 runs and 13 later runs, their separate probe versions, and manifests.
+It excludes the data files and compiled binaries.
+
+## Experimental snapshots
+
+| Snapshot | Commit |
+| --- | --- |
+| Probe with unchanged production engine | [9c5f5d553](https://github.com/rich7420/datafusion-comet/tree/9c5f5d553) |
+| A: interruption checks around JNI | [e83863572](https://github.com/rich7420/datafusion-comet/tree/e83863572) |
+| B: native cancellation prototype, tests and results | This branch's tip |
+
+The baseline and A snapshots use the second round's common probe. Rebuild native
+and JVM code after switching snapshots, and keep each run's output directory
+separate. All three snapshots are based on upstream `c4a0b1f2b`.
+
+## Build and run
+
 Requires Python 3.11 or newer (the recorded runs used Python 3.14) and JDK 21.
 Build from the worktree root, without Maven `-pl`:
 
 ```sh
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
 cargo build --manifest-path native/Cargo.toml --release
-./mvnw -B test-compile dependency:build-classpath -Dmdep.outputFile=target/cancellation-classpath.txt -Dmdep.includeScope=test -DskipTests
+./mvnw -B -Prelease test-compile dependency:build-classpath -Dmdep.outputFile=target/cancellation-classpath.txt -Dmdep.includeScope=test -DskipTests
 ```
 
 Use a scratch destination with enough space for uncompressible Parquet and fresh

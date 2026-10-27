@@ -21,7 +21,7 @@ package org.apache.comet
 
 import java.lang.management.ManagementFactory
 import java.util.Locale
-import java.util.concurrent.{ConcurrentHashMap, Executors, ThreadFactory, TimeUnit}
+import java.util.concurrent.{ConcurrentHashMap, Executors, ScheduledExecutorService, ScheduledFuture, ScheduledThreadPoolExecutor, ThreadFactory, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.util.Try
@@ -111,6 +111,7 @@ class CometExecIterator(
   private val taskCPUs = TaskContext.get().cpus().toLong
   private val taskMemory = CometExecIterator.taskMemory(TaskContext.get(), id)
   private val cometTaskMemoryManager = taskMemory.manager
+  private var cancellationWatcher: CometExecIterator.CancellationWatcher = _
 
   private val plan = {
     val conf = SparkEnv.get.conf
@@ -166,9 +167,19 @@ class CometExecIterator(
       shufflePartitionPusher.foreach { pusher =>
         nativeLib.setShufflePartitionPusher(createdPlan, pusher)
       }
+      cancellationWatcher = new CometExecIterator.CancellationWatcher(
+        nativeLib,
+        TaskContext.get(),
+        id,
+        CometExecIterator.cancellationScheduler)
+      cancellationWatcher.start(createdPlan)
       createdPlan
     } catch {
       case failure: Throwable =>
+        if (cancellationWatcher != null) {
+          try cancellationWatcher.close()
+          catch { case closeFailure: Throwable => failure.addSuppressed(closeFailure) }
+        }
         // The task-completion listener is not installed until iterator construction succeeds.
         try {
           nativeUtil.close()
@@ -374,6 +385,10 @@ class CometExecIterator(
       }
 
       attempt {
+        if (cancellationWatcher != null) cancellationWatcher.close()
+      }
+
+      attempt {
         if (currentBatch != null) {
           currentBatch.close()
           currentBatch = null
@@ -428,6 +443,83 @@ class CometExecIterator(
 object CometExecIterator extends Logging {
   private[comet] def traceCancellation(id: Long, phase: String): Unit =
     logDebug(s"cancellation_trace plan=$id phase=$phase nano_time=${System.nanoTime()}")
+
+  private lazy val cancellationScheduler = {
+    val scheduler = new ScheduledThreadPoolExecutor(
+      1,
+      new ThreadFactory {
+        override def newThread(runnable: Runnable): Thread = {
+          val thread = new Thread(runnable, "comet-plan-cancellation")
+          thread.setDaemon(true)
+          thread
+        }
+      })
+    scheduler.setRemoveOnCancelPolicy(true)
+    scheduler
+  }
+
+  private[comet] final class CancellationWatcher(
+      nativeLib: Native,
+      context: TaskContext,
+      id: Long,
+      scheduler: ScheduledExecutorService)
+      extends AutoCloseable {
+    private var handle = 0L
+    private var future: ScheduledFuture[_] = _
+    private var retired = false
+    private var started = false
+
+    def start(plan: Long): Unit = synchronized {
+      require(!started && !retired, "Cancellation watcher already started or closed")
+      started = true
+      try {
+        handle = nativeLib.createCancellationHandle(plan)
+        future = scheduler.scheduleWithFixedDelay(
+          new Runnable { override def run(): Unit = poll() },
+          0L,
+          25L,
+          TimeUnit.MILLISECONDS)
+      } catch {
+        case failure: Throwable =>
+          try retire()
+          catch { case closeFailure: Throwable => failure.addSuppressed(closeFailure) }
+          throw failure
+      }
+    }
+
+    private def poll(): Unit = synchronized {
+      if (!retired) {
+        if (context.isInterrupted()) {
+          try {
+            traceCancellation(id, "cancel_send")
+            nativeLib.cancelPlan(handle)
+            traceCancellation(id, "cancel_ack")
+          } catch {
+            case NonFatal(failure) =>
+              logWarning(s"Failed to cancel native plan $id", failure)
+              throw failure
+          } finally retire()
+        } else if (context.isCompleted()) {
+          retire()
+        }
+      }
+    }
+
+    private def retire(): Unit = {
+      if (!retired) {
+        retired = true
+        val releasedHandle = handle
+        handle = 0L
+        try {
+          if (future != null) future.cancel(false)
+        } finally {
+          if (releasedHandle != 0L) nativeLib.releaseCancellationHandle(releasedHandle)
+        }
+      }
+    }
+
+    override def close(): Unit = synchronized { retire() }
+  }
 
   /** The [[TaskMemory]] of each task running native plans, until the task completes. */
   private val taskMemories = new ConcurrentHashMap[TaskContext, TaskMemory]()

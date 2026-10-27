@@ -26,6 +26,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import scala.reflect.ClassTag
+import scala.util.{Success, Try}
 
 import org.apache.arrow.c.ArrowArrayStream
 import org.apache.arrow.memory.RootAllocator
@@ -44,10 +45,19 @@ import org.apache.spark.sql.types.{LongType, StructField, StructType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 import org.apache.spark.util.JsonProtocol
 
-import org.apache.comet.{CometArrowAllocator, CometConf, CometExecIterator, CometExecutorMemoryUsage, CometNativeException, CometShuffleBlockIterator, Native}
+import org.apache.comet.{CometArrowAllocator, CometArrowImportAllocator, CometConf, CometExecIterator, CometExecutorMemoryUsage, CometNativeException, CometShuffleBlockIterator, Native}
 import org.apache.comet.serde.Config.ConfigMap
 import org.apache.comet.serde.OperatorOuterClass
 import org.apache.comet.vector.CometPlainVector
+
+object CometCancellationTestContext {
+  def apply(interrupted: Boolean = false, completed: Boolean = false): TaskContext = {
+    val context = TaskContext.empty()
+    if (interrupted) context.markInterrupted("cancelled by test")
+    if (completed) context.markTaskCompleted(None)
+    context
+  }
+}
 
 /**
  * Regression tests for the native plan lifecycle: every `createPlan` must be balanced by exactly
@@ -94,6 +104,113 @@ class CometExecIteratorLifecycleSuite extends CometTestBase {
       Thread.sleep(50)
     }
     refs.count(_.get() != null)
+  }
+
+  Seq("before JNI", "during JNI", "with input failure", "not interrupted").foreach { when =>
+    test(s"task cancellation $when preserves native batch ownership") {
+      val importedBefore = CometArrowImportAllocator.getAllocatedMemory
+      val allocator = CometArrowAllocator.newChildAllocator("cancelled-input", 0, Long.MaxValue)
+      val vector = new BigIntVector("test", allocator)
+      try {
+        withTaskContext(4700000L) {
+          val context = TaskContext.get().asInstanceOf[TaskContextImpl]
+          vector.allocateNew(2)
+          vector.set(0, 1L)
+          vector.set(1, 2L)
+          vector.setValueCount(2)
+          val input = new ColumnarBatch(Array[ColumnVector](new CometPlainVector(vector)), 2) {
+            override def close(): Unit = {
+              super.close()
+              if (when == "during JNI" || when == "with input failure") {
+                context.markInterrupted("cancelled while native pulled its input")
+                if (when == "with input failure") {
+                  throw new IllegalStateException("input failed while the task was cancelled")
+                }
+              }
+            }
+          }
+          val schema = StructType(Seq(StructField("test", LongType, nullable = false)))
+          val stream = CometArrowStream.fromColumnarBatchIter(
+            Iterator.single(input),
+            schema,
+            CometArrowStream.NATIVE_TIMEZONE,
+            "cancelled-input")
+          val limitOp =
+            CometExecUtils.getLimitNativePlan(Seq(PrettyAttribute("test", LongType)), 100).get
+          val iter = CometExec.getCometIterator(
+            Array(stream.asInstanceOf[Object]),
+            1,
+            limitOp,
+            CometMetricNode(Map.empty),
+            1,
+            0,
+            None,
+            Seq.empty)
+          try {
+            if (when == "before JNI") context.markInterrupted("cancelled before native execution")
+            val outcome = Try {
+              if (iter.hasNext) {
+                assert(iter.next().numRows() == 2)
+                true
+              } else false
+            }
+            if (when == "not interrupted") assert(outcome == Success(true))
+            else
+              assert(
+                outcome.failed.toOption.exists(_.isInstanceOf[TaskKilledException]),
+                s"expected task cancellation, got $outcome")
+          } finally iter.close()
+        }
+      } finally {
+        vector.close()
+        allocator.close()
+      }
+      assert(CometArrowImportAllocator.getAllocatedMemory == importedBefore)
+    }
+  }
+
+  test("a cancellation handle and its plan can be released in either order") {
+    withTaskContext(4800000L) {
+      val native = new Native()
+      val limitOp =
+        CometExecUtils.getLimitNativePlan(Seq(PrettyAttribute("test", LongType)), 100).get
+      for (handleFirst <- Seq(false, true)) {
+        var plan = native.createPlan(
+          4800000L,
+          Array.empty[Object],
+          limitOp.toByteArray,
+          ConfigMap.newBuilder().build().toByteArray,
+          1,
+          CometMetricNode(Map.empty),
+          0L,
+          new CometTaskMemoryManager(4800000L, 4800000L),
+          Array(System.getProperty("java.io.tmpdir")),
+          8192,
+          true,
+          "fair_unified",
+          64L << 20,
+          64L << 20,
+          4800000L,
+          1L,
+          null,
+          null,
+          null)
+        var handle = 0L
+        try {
+          handle = native.createCancellationHandle(plan)
+          if (handleFirst) {
+            native.releaseCancellationHandle(handle)
+            handle = 0L
+          }
+          native.releasePlan(plan)
+          plan = 0L
+          if (!handleFirst) native.cancelPlan(handle)
+        } finally {
+          if (handle != 0L) native.releaseCancellationHandle(handle)
+          if (plan != 0L) native.releasePlan(plan)
+        }
+      }
+    }
   }
 
   test("createPlan failure releases the task-shared memory pool reference") {

@@ -99,6 +99,15 @@ class Native extends NativeBase {
    */
   @native def setShufflePartitionPusher(plan: Long, pusher: ShufflePartitionPusher): Unit
 
+  /** Clone an independent cancellation handle before executePlan starts. */
+  @native def createCancellationHandle(plan: Long): Long
+
+  /** Signal cancellation without accessing the executing plan. */
+  @native def cancelPlan(cancellationHandle: Long): Unit
+
+  /** The caller must exclude concurrent cancelPlan calls for this handle. */
+  @native def releaseCancellationHandle(cancellationHandle: Long): Unit
+
   /**
    * Execute a native query plan based on given input Arrow arrays.
    *

@@ -116,6 +116,7 @@ use std::{
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::execution::memory_pools::{
     create_memory_pool, overcommit, parse_memory_pool_config, MemoryPoolConfig, PlanMemoryPool,
@@ -544,6 +545,7 @@ struct ExecutionContext {
     pub stream: Option<SendableRecordBatchStream>,
     /// Runs the plan when it has no JVM input (async I/O path)
     batch_producer: Option<BatchProducer>,
+    cancellation: CancellationToken,
     /// The pool every reservation the plan makes goes through
     plan_memory: Arc<PlanMemoryPool>,
     /// The JVM `CometMetricNode` the plan's metrics are published to. `None` only without a
@@ -707,6 +709,53 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_createPlan(
 
             Ok(Box::into_raw(exec_context) as i64)
         })
+    })
+}
+
+/// Creates an independently owned cancellation handle before the plan starts executing.
+#[no_mangle]
+pub extern "system" fn Java_org_apache_comet_Native_createCancellationHandle(
+    e: EnvUnowned,
+    _class: JClass,
+    exec_context: jlong,
+) -> jlong {
+    try_unwrap_or_throw(&e, |_| {
+        let context = get_execution_context(exec_context)?;
+        Ok(Box::into_raw(Box::new(context.cancellation.clone())) as jlong)
+    })
+}
+
+/// The caller serializes this call with `releaseCancellationHandle`.
+#[no_mangle]
+pub extern "system" fn Java_org_apache_comet_Native_cancelPlan(
+    e: EnvUnowned,
+    _class: JClass,
+    cancellation_handle: jlong,
+) {
+    try_unwrap_or_throw(&e, |_| {
+        // This borrows only the independent token, never the executing plan.
+        let token = unsafe { (cancellation_handle as *const CancellationToken).as_ref() }
+            .ok_or_else(|| CometError::NullPointer("Null cancellation handle".to_string()))?;
+        token.cancel();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_comet_Native_releaseCancellationHandle(
+    e: EnvUnowned,
+    _class: JClass,
+    cancellation_handle: jlong,
+) {
+    try_unwrap_or_throw(&e, |_| {
+        if cancellation_handle == 0 {
+            return Err(CometError::NullPointer(
+                "Null cancellation handle".to_string(),
+            ));
+        }
+        // The JVM owner has retired the handle and excluded concurrent cancel calls.
+        drop(unsafe { Box::from_raw(cancellation_handle as *mut CancellationToken) });
+        Ok(())
     })
 }
 
@@ -882,6 +931,7 @@ fn create_execution_context(
         input_sources: jvm.input_sources,
         stream: None,
         batch_producer: None,
+        cancellation: CancellationToken::new(),
         plan_memory,
         metrics: jvm.metrics,
         metrics_update_interval,
@@ -1356,8 +1406,20 @@ impl BatchProducer {
     /// A channel that closes before the stream has ended means the task was cancelled, and the
     /// plan's output is incomplete. That is an error, or the Spark task would end successfully
     /// with only the batches it has read so far.
-    fn next_batch(&mut self) -> CometResult<Option<RecordBatch>> {
-        match self.batches.blocking_recv() {
+    fn next_batch(&mut self, cancellation: &CancellationToken) -> CometResult<Option<RecordBatch>> {
+        futures::executor::block_on(self.receive_next_batch(cancellation))
+    }
+
+    async fn receive_next_batch(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> CometResult<Option<RecordBatch>> {
+        let batch = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(cancelled_plan()),
+            batch = self.batches.recv() => Ok(batch),
+        }?;
+        match batch {
             Some(batch) => Ok(Some(batch?)),
             None if self.stream_ended.load(Ordering::Acquire) => Ok(None),
             None => Err(CometError::Internal(
@@ -1470,6 +1532,9 @@ fn execute_plan(
     partition: i32,
     publish_metrics: &mut PublishMetrics,
 ) -> CometResult<Option<RecordBatch>> {
+    if exec_context.cancellation.is_cancelled() {
+        return Err(cancelled_plan());
+    }
     let exec_context_id = exec_context.id;
 
     // Initialize the execution stream.
@@ -1520,7 +1585,7 @@ fn execute_plan(
     }
 
     if let Some(producer) = &mut exec_context.batch_producer {
-        return match producer.next_batch()? {
+        return match producer.next_batch(&exec_context.cancellation)? {
             Some(batch) => {
                 // Publish on the configured interval, as the ScanExec path below does,
                 // since each publish walks the whole metric tree and calls into the JVM.
@@ -1540,10 +1605,15 @@ fn execute_plan(
     // the stream by the end of the pull, waits on native I/O, and `next_batch` parks
     // until it completes.
     let mut stream = exec_context.stream.take().unwrap();
-    let next = get_runtime().block_on(next_batch(&mut stream, || {
-        pull_input_batches(exec_context)?;
-        update_metrics_on_interval(exec_context, publish_metrics)
-    }));
+    let cancellation = exec_context.cancellation.clone();
+    let next = get_runtime().block_on(cancellable_next_batch(
+        &mut stream,
+        || {
+            pull_input_batches(exec_context)?;
+            update_metrics_on_interval(exec_context, publish_metrics)
+        },
+        &cancellation,
+    ));
     exec_context.stream = Some(stream);
     let next = next?;
     update_metrics_on_interval(exec_context, publish_metrics)?;
@@ -1551,6 +1621,33 @@ fn execute_plan(
         log_plan_metrics(exec_context, stage_id, partition);
     }
     Ok(next)
+}
+
+fn cancelled_plan() -> CometError {
+    DataFusionError::Execution("Native plan was cancelled".to_string()).into()
+}
+
+async fn cancellable_next_batch<S>(
+    stream: &mut S,
+    mut on_pending: impl FnMut() -> CometResult<()>,
+    cancellation: &CancellationToken,
+) -> CometResult<Option<RecordBatch>>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(cancelled_plan()),
+        batch = next_batch(stream, || {
+            let result = on_pending();
+            // A nested block_on in the callback can consume cancellation's wake-up.
+            if cancellation.is_cancelled() {
+                Err(cancelled_plan())
+            } else {
+                result
+            }
+        }) => batch,
+    }
 }
 
 #[no_mangle]
@@ -3118,6 +3215,202 @@ mod tests {
         ))
     }
 
+    fn receive_pending_batch(
+        producer: &mut BatchProducer,
+        cancellation: &CancellationToken,
+        pending: std::sync::mpsc::Sender<()>,
+    ) -> CometResult<Option<RecordBatch>> {
+        let future = producer.receive_next_batch(cancellation);
+        futures::pin_mut!(future);
+        let mut pending = Some(pending);
+        futures::executor::block_on(poll_fn(|cx| {
+            let result = future.as_mut().poll(cx);
+            if result.is_pending() {
+                if let Some(pending) = pending.take() {
+                    pending.send(()).unwrap();
+                }
+            }
+            result
+        }))
+    }
+
+    #[test]
+    fn cancellation_wins_over_a_ready_batch_or_eof() {
+        let runtime = single_worker_runtime();
+        for batches in [vec![Ok(empty_batch())], vec![]] {
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            let mut producer = BatchProducer::spawn(
+                runtime.handle(),
+                plan_stream(futures::stream::iter(batches)),
+            );
+            runtime.block_on(&mut producer.task).unwrap();
+            let result = producer.next_batch(&cancellation);
+            producer.stop().unwrap();
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+        }
+    }
+
+    #[test]
+    fn cancellation_wakes_the_consumer_without_a_free_worker() {
+        let runtime = single_worker_runtime();
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let (input_tx, input_rx) = tokio::sync::oneshot::channel::<()>();
+        let stream = futures::stream::once(async move {
+            polled_tx.send(()).unwrap();
+            let _ = input_rx.await;
+            Ok(empty_batch())
+        });
+        let mut producer = BatchProducer::spawn(runtime.handle(), plan_stream(stream));
+        polled_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        runtime.spawn(async move {
+            blocked_tx.send(()).unwrap();
+            let _ = unblock_rx.recv_timeout(Duration::from_secs(10));
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let result = receive_pending_batch(&mut producer, &cancelled, pending_tx);
+            producer.stop().unwrap();
+            result_tx.send(result).unwrap();
+        });
+        pending_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancellation.cancel();
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        let _ = unblock_tx.send(());
+        let _ = input_tx.send(());
+        caller.join().unwrap();
+        assert!(result
+            .expect("cancellation waited for a Tokio worker")
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+    }
+
+    #[test]
+    fn cancellation_wakes_the_consumer_but_cleanup_waits_for_a_poll() {
+        let runtime = single_worker_runtime();
+        let (polling_tx, polling_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let mut first = true;
+        let stream = futures::stream::poll_fn(move |_| {
+            if first {
+                first = false;
+                polling_tx.send(()).unwrap();
+                let _ = finish_rx.recv_timeout(Duration::from_secs(10));
+            }
+            Poll::Ready(Some(Ok(empty_batch())))
+        });
+        let mut producer = BatchProducer::spawn(runtime.handle(), plan_stream(stream));
+        polling_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let (woke_tx, woke_rx) = std::sync::mpsc::channel();
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            woke_tx
+                .send(receive_pending_batch(&mut producer, &cancelled, pending_tx))
+                .unwrap();
+            producer.stop().unwrap();
+            stopped_tx.send(()).unwrap();
+        });
+        pending_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancellation.cancel();
+        let woke = woke_rx.recv_timeout(Duration::from_secs(2));
+        let stopped_early = stopped_rx.recv_timeout(Duration::from_millis(20)).is_ok();
+        let _ = finish_tx.send(());
+        caller.join().unwrap();
+        assert!(woke
+            .expect("the consumer did not wake during a long poll")
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        assert!(
+            !stopped_early,
+            "cleanup returned while a poll was still running"
+        );
+        stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn cancellation_wakes_a_pending_jvm_fed_stream() {
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let (input_tx, input_rx) = futures::channel::oneshot::channel::<()>();
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let mut stream = futures::stream::once(async move {
+                polled_tx.send(()).unwrap();
+                let _ = input_rx.await;
+                Ok(empty_batch())
+            })
+            .boxed();
+            result_tx
+                .send(futures::executor::block_on(cancellable_next_batch(
+                    &mut stream,
+                    || Ok(()),
+                    &cancelled,
+                )))
+                .unwrap();
+        });
+        polled_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancellation.cancel();
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        let _ = input_tx.send(());
+        caller.join().unwrap();
+        assert!(result
+            .expect("a pending JVM-fed stream did not wake")
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+
+        let mut empty = futures::stream::empty::<DataFusionResult<RecordBatch>>();
+        assert!(futures::executor::block_on(cancellable_next_batch(
+            &mut empty,
+            || Ok(()),
+            &CancellationToken::new(),
+        ))
+        .unwrap()
+        .is_none());
+        assert!(futures::executor::block_on(cancellable_next_batch(
+            &mut empty,
+            || Ok(()),
+            &cancellation,
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn cancellation_after_a_nested_block_on_does_not_lose_its_wake() {
+        let runtime = single_worker_runtime();
+        let handle = runtime.handle().clone();
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancelled.cancel();
+        });
+        let mut stream = futures::stream::pending::<DataFusionResult<RecordBatch>>();
+        let result = runtime.block_on(without_a_lost_wake(cancellable_next_batch(
+            &mut stream,
+            || {
+                handle.block_on(tokio::time::sleep(Duration::from_millis(100)));
+                Ok(())
+            },
+            &cancellation,
+        )));
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
     /// See issue #2453. A consumer that stops early can leave the producer waiting on its input,
     /// still holding the stream.
     #[test]
@@ -3137,7 +3430,10 @@ mod tests {
         });
 
         let mut producer = BatchProducer::spawn(runtime.handle(), plan_stream(stream));
-        assert!(producer.next_batch().unwrap().is_some());
+        assert!(producer
+            .next_batch(&CancellationToken::new())
+            .unwrap()
+            .is_some());
         producer.stop().unwrap();
         assert_eq!(pool.reserved(), 0, "the stream outlived its producer");
     }
@@ -3165,7 +3461,10 @@ mod tests {
         });
 
         let mut producer = BatchProducer::spawn(runtime.handle(), plan_stream(stream));
-        assert!(producer.next_batch().unwrap().is_some());
+        assert!(producer
+            .next_batch(&CancellationToken::new())
+            .unwrap()
+            .is_some());
         polling_rx.recv().unwrap();
         let finished = Arc::new(AtomicBool::new(false));
         let finishing = {
@@ -3278,7 +3577,10 @@ mod tests {
             }
         });
         let mut producer = BatchProducer::spawn(runtime.handle(), plan_stream(stream));
-        assert!(producer.next_batch().unwrap().is_some());
+        assert!(producer
+            .next_batch(&CancellationToken::new())
+            .unwrap()
+            .is_some());
 
         // Holds the only worker until the stopped plan's memory comes back, as another task
         // waiting in `acquireMemory` does. It gives up eventually so a failure cannot hang the
@@ -3388,14 +3690,17 @@ mod tests {
             None => Poll::Pending,
         });
         let mut producer = BatchProducer::spawn(runtime.handle(), plan_stream(stream));
-        assert!(producer.next_batch().unwrap().is_some());
+        assert!(producer
+            .next_batch(&CancellationToken::new())
+            .unwrap()
+            .is_some());
 
         // Shuts the runtime down while the consumer waits for the next batch.
         let shutting_down = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             runtime.shutdown_timeout(Duration::from_secs(10));
         });
-        match producer.next_batch() {
+        match producer.next_batch(&CancellationToken::new()) {
             Err(CometError::Internal(msg)) => assert!(msg.contains("cancelled"), "{msg}"),
             other => panic!("expected an error, got {other:?}"),
         }
@@ -3414,9 +3719,18 @@ mod tests {
         runtime.block_on(&mut producer.task).unwrap();
         runtime.shutdown_timeout(Duration::from_secs(10));
 
-        assert!(producer.next_batch().unwrap().is_some());
-        assert!(producer.next_batch().unwrap().is_some());
-        assert!(producer.next_batch().unwrap().is_none());
+        assert!(producer
+            .next_batch(&CancellationToken::new())
+            .unwrap()
+            .is_some());
+        assert!(producer
+            .next_batch(&CancellationToken::new())
+            .unwrap()
+            .is_some());
+        assert!(producer
+            .next_batch(&CancellationToken::new())
+            .unwrap()
+            .is_none());
         producer.stop().unwrap();
     }
 

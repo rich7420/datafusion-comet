@@ -19,9 +19,12 @@
 
 package org.apache.comet
 
+import java.util.concurrent.{CountDownLatch, RejectedExecutionException, ScheduledThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+
 import scala.concurrent.duration.DurationInt
 
-import org.apache.spark.{SparkEnv, SparkException}
+import org.apache.spark.{CometCancellationTestContext, SparkEnv, SparkException}
 import org.apache.spark.sql.{CometTestBase, DataFrame}
 import org.apache.spark.sql.catalyst.expressions.PrettyAttribute
 import org.apache.spark.sql.comet.{CometBroadcastExchangeExec, CometExec, CometExecUtils}
@@ -31,6 +34,96 @@ import org.apache.spark.sql.types.{LongType, StructField, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 class CometNativeSuite extends CometTestBase {
+  private class CancellationNative extends Native {
+    val created = new AtomicInteger()
+    val cancelled = new AtomicInteger()
+    val released = new AtomicInteger()
+    override def createCancellationHandle(plan: Long): Long = {
+      created.incrementAndGet()
+      1L
+    }
+    override def cancelPlan(handle: Long): Unit = { cancelled.incrementAndGet() }
+    override def releaseCancellationHandle(handle: Long): Unit = { released.incrementAndGet() }
+  }
+
+  test("cancellation watcher rolls back its handle when scheduling is rejected") {
+    val native = new CancellationNative
+    val scheduler = new ScheduledThreadPoolExecutor(1)
+    scheduler.shutdownNow()
+    val watcher =
+      new CometExecIterator.CancellationWatcher(
+        native,
+        CometCancellationTestContext(),
+        1L,
+        scheduler)
+    intercept[RejectedExecutionException](watcher.start(42L))
+    watcher.close()
+    assert(native.created.get() == 1)
+    assert(native.released.get() == 1)
+    assert(native.cancelled.get() == 0)
+  }
+
+  test("cancellation watcher retires an already completed task without retaining a timer") {
+    val scheduler = new ScheduledThreadPoolExecutor(1)
+    scheduler.setRemoveOnCancelPolicy(true)
+    val context = CometCancellationTestContext(completed = true)
+    val releaseObserved = new CountDownLatch(1)
+    val notifying = new CancellationNative {
+      override def releaseCancellationHandle(handle: Long): Unit = {
+        super.releaseCancellationHandle(handle)
+        releaseObserved.countDown()
+      }
+    }
+    val watcher = new CometExecIterator.CancellationWatcher(notifying, context, 1L, scheduler)
+    try {
+      watcher.start(42L)
+      assert(releaseObserved.await(5, TimeUnit.SECONDS))
+      watcher.close()
+      assert(scheduler.getQueue.isEmpty)
+      assert(notifying.released.get() == 1)
+      assert(notifying.cancelled.get() == 0)
+    } finally {
+      watcher.close()
+      scheduler.shutdownNow()
+    }
+  }
+
+  test("cancellation watcher excludes handle release while cancel is in progress") {
+    val context = CometCancellationTestContext(interrupted = true)
+    val cancelling = new CountDownLatch(1)
+    val finish = new CountDownLatch(1)
+    val overlapping = new AtomicBoolean(false)
+    val native = new CancellationNative {
+      override def cancelPlan(handle: Long): Unit = {
+        super.cancelPlan(handle)
+        cancelling.countDown()
+        assert(finish.await(5, TimeUnit.SECONDS))
+        overlapping.set(released.get() != 0)
+      }
+    }
+    val scheduler = new ScheduledThreadPoolExecutor(1)
+    val watcher = new CometExecIterator.CancellationWatcher(native, context, 1L, scheduler)
+    val closed = new CountDownLatch(1)
+    val closeThread = new Thread(() => { watcher.close(); closed.countDown() })
+    try {
+      watcher.start(42L)
+      assert(cancelling.await(5, TimeUnit.SECONDS))
+      closeThread.start()
+      assert(!closed.await(50, TimeUnit.MILLISECONDS))
+      finish.countDown()
+      assert(closed.await(5, TimeUnit.SECONDS))
+      watcher.close()
+      assert(!overlapping.get())
+      assert(native.cancelled.get() == 1)
+      assert(native.released.get() == 1)
+    } finally {
+      finish.countDown()
+      closeThread.join(5000)
+      watcher.close()
+      scheduler.shutdownNow()
+    }
+  }
+
   test("test handling NPE thrown by JVM") {
     val rdd = spark.range(0, 1).rdd.map { value =>
       val limitOp =
