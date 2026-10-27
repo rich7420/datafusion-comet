@@ -32,6 +32,7 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.hadoop.conf.Configuration
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.comet.CometTaskContextShim
 import org.apache.spark.internal.Logging
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.sql.comet.CometMetricNode
@@ -259,7 +260,20 @@ class CometExecIterator(
           nativeUtil.getNextBatch(
             numOutputCols,
             (arrayAddrs, schemaAddrs) => {
-              nativeLib.executePlan(ctx.stageId(), partitionIndex, plan, arrayAddrs, schemaAddrs)
+              CometTaskContextShim.killTaskIfInterrupted(ctx)
+              try
+                nativeLib.executePlan(
+                  ctx.stageId(),
+                  partitionIndex,
+                  plan,
+                  arrayAddrs,
+                  schemaAddrs)
+              finally {
+                if (ctx.isInterrupted()) {
+                  CometExecIterator.traceCancellation(id, "execute_return")
+                }
+                CometTaskContextShim.killTaskIfInterrupted(ctx)
+              }
             })
         })
 
@@ -273,6 +287,8 @@ class CometExecIterator(
 
       result
     } catch {
+      case failure: TaskKilledException => throw failure
+
       // Native saw only the text of what a JVM input threw, so rethrow the exception itself.
       case InputFailure(failure) =>
         throw failure
@@ -341,6 +357,7 @@ class CometExecIterator(
   def close(): Unit = synchronized {
     if (!closed) {
       closed = true
+      CometExecIterator.traceCancellation(id, "close_begin")
 
       // Attempt every resource's cleanup independently, so that one failure does not skip the
       // remaining resources: this close() is the only chance to release them, since `closed` is
@@ -368,7 +385,11 @@ class CometExecIterator(
       // Released last and exactly once, even if the teardown above failed: dropping the native
       // execution context frees this plan's task-shared memory pool reference and several JNI
       // global refs.
-      attempt(nativeLib.releasePlan(plan))
+      attempt {
+        CometExecIterator.traceCancellation(id, "release_begin")
+        try nativeLib.releasePlan(plan)
+        finally CometExecIterator.traceCancellation(id, "release_return")
+      }
 
       // Drops what the task's JVM UDFs keep for this plan, such as its dispatched kernels. `id` is
       // the plan id the native plan passed them.
@@ -405,6 +426,8 @@ class CometExecIterator(
 }
 
 object CometExecIterator extends Logging {
+  private[comet] def traceCancellation(id: Long, phase: String): Unit =
+    logDebug(s"cancellation_trace plan=$id phase=$phase nano_time=${System.nanoTime()}")
 
   /** The [[TaskMemory]] of each task running native plans, until the task completes. */
   private val taskMemories = new ConcurrentHashMap[TaskContext, TaskMemory]()

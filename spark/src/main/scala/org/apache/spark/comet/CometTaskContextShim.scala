@@ -22,7 +22,7 @@ package org.apache.spark.comet
 import org.apache.spark.TaskContext
 
 /**
- * Package-private access shim for `TaskContext.setTaskContext` / `TaskContext.unset`.
+ * Package-private access shim for Spark's `TaskContext` operations.
  *
  * Both methods are declared `protected[spark]` on Spark's `TaskContext` companion, so they are
  * reachable from code inside the `org.apache.spark` package tree but not from `org.apache.comet`.
@@ -34,6 +34,8 @@ import org.apache.spark.TaskContext
  * `org.apache.comet.udf`) can use.
  */
 object CometTaskContextShim {
+
+  def killTaskIfInterrupted(taskContext: TaskContext): Unit = taskContext.killTaskIfInterrupted()
 
   def set(taskContext: TaskContext): Unit = TaskContext.setTaskContext(taskContext)
 
