@@ -2227,4 +2227,100 @@ mod tests {
             );
         }
     }
+
+    /// Writes a BINARY column `s` without the UTF8 annotation, holding `0xFF` and `a`, whose
+    /// `ARROW:schema` says `hint`, and scans it as Spark's BinaryType.
+    async fn scan_unannotated_binary_with_hint(hint: DataType, dictionary_pages: bool) {
+        use arrow::array::AsArray;
+        use parquet::arrow::{encode_arrow_schema, ARROW_SCHEMA_META_KEY};
+        use parquet::data_type::{ByteArray, ByteArrayType, Int32Type};
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let parquet_schema = Arc::new(
+            parse_message_type("message test { REQUIRED INT32 a; OPTIONAL BINARY s; }").unwrap(),
+        );
+        let arrow_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("s", hint, true),
+        ]);
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(dictionary_pages)
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                ARROW_SCHEMA_META_KEY.to_string(),
+                encode_arrow_schema(&arrow_schema),
+            )]))
+            .build();
+        let path = get_temp_filename().to_str().unwrap().to_owned();
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, parquet_schema, Arc::new(props)).unwrap();
+        let mut row_group = writer.next_row_group().unwrap();
+        let mut column = row_group.next_column().unwrap().unwrap();
+        column
+            .typed::<Int32Type>()
+            .write_batch(&[1, 2], None, None)
+            .unwrap();
+        column.close().unwrap();
+        let mut column = row_group.next_column().unwrap().unwrap();
+        let values = [ByteArray::from(vec![0xff]), ByteArray::from(b"a".to_vec())];
+        column
+            .typed::<ByteArrayType>()
+            .write_batch(&values, Some(&[1, 1]), None)
+            .unwrap();
+        column.close().unwrap();
+        row_group.close().unwrap();
+        writer.close().unwrap();
+
+        let required_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("s", DataType::Binary, true),
+        ]));
+        let session_ctx = Arc::new(SessionContext::new());
+        let scan = init_datasource_exec(
+            Arc::clone(&required_schema),
+            Some(required_schema),
+            None,
+            ObjectStoreUrl::local_filesystem(),
+            ObjectStoreBackend::Local,
+            vec![vec![PartitionedFile::from_path(path).unwrap()]],
+            Some(vec![0, 1]),
+            Some(vec![]),
+            None,
+            "UTC",
+            true,
+            false,
+            false,
+            false,
+            &session_ctx,
+            false,
+            false,
+            false,
+            false,
+            "",
+            "",
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = scan
+            .execute(0, session_ctx.task_ctx())
+            .unwrap()
+            .map(|batch| batch.unwrap())
+            .collect()
+            .await;
+        let values: Vec<Option<&[u8]>> = batches
+            .iter()
+            .flat_map(|batch| batch.column(1).as_binary::<i32>().iter())
+            .collect();
+        assert_eq!(values, vec![Some(&[0xff][..]), Some(&b"a"[..])]);
+    }
+
+    #[tokio::test]
+    async fn unannotated_binary_with_utf8_hint() {
+        scan_unannotated_binary_with_hint(DataType::Utf8, false).await;
+    }
+
+    #[tokio::test]
+    async fn unannotated_binary_with_dictionary_utf8_hint() {
+        let hint = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        scan_unannotated_binary_with_hint(hint, true).await;
+    }
 }
